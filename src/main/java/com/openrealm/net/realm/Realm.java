@@ -805,13 +805,68 @@ public class Realm {
         return this.enemies.get(enemyId);
     }
 
+    /**
+     * Spatial-grid query helper for the enemy-tick path. Returns enemy ids
+     * within {@code radius} of (x, y). Filters out players / bullets / loot
+     * (also stored in the grid) so callers don't have to.
+     *
+     * Used by RealmManagerServer.update to narrow the candidate set before
+     * the per-enemy distance-classification loop runs — anything outside the
+     * query is guaranteed dormant (no player's chase range can reach that
+     * far) so we skip it entirely instead of paying for the dist check.
+     */
+    public List<Long> queryEnemiesNear(float x, float y, float radius) {
+        if (this.spatialGrid == null) return java.util.Collections.emptyList();
+        final List<Long> raw = this.spatialGrid.queryRadius(x, y, radius);
+        if (raw.isEmpty()) return raw;
+        final List<Long> out = new ArrayList<>(raw.size());
+        for (int i = 0; i < raw.size(); i++) {
+            final long id = raw.get(i);
+            if (this.enemies.containsKey(id)) out.add(id);
+        }
+        return out;
+    }
+
     public boolean removeEnemy(Enemy enemy) {
         final Enemy e = this.enemies.remove(enemy.getId());
         if (this.spatialGrid != null) {
             this.spatialGrid.remove(enemy.getId());
         }
         this.shortIdAllocator.release(enemy.getId());
+        // Reap in-flight bullets owned by this enemy. Without this, bullets
+        // outlive their source for up to 10s (MAX_LIFETIME_TICKS = 640) —
+        // under heavy spawn-then-cull load the realm sits near the
+        // MAX_ENEMY_BULLETS_PER_REALM cap for the full lifetime window,
+        // streaming ghost bullets to clients long after the shooter is gone.
+        reapBulletsFromEnemy(enemy.getId());
         return e != null;
+    }
+
+    /**
+     * Drop every enemy bullet whose srcEntityId matches the given enemy.
+     * Called from removeEnemy so dead enemies stop leaking visual ammo.
+     * Player bullets (srcEntityId == player.id) are never affected because
+     * the check is name-scoped to enemy ids only via the caller.
+     */
+    private void reapBulletsFromEnemy(long srcEnemyId) {
+        if (srcEnemyId == 0L || this.bullets == null || this.bullets.isEmpty()) return;
+        int reaped = 0;
+        final java.util.Iterator<java.util.Map.Entry<Long, Bullet>> it = this.bullets.entrySet().iterator();
+        while (it.hasNext()) {
+            final java.util.Map.Entry<Long, Bullet> entry = it.next();
+            final Bullet b = entry.getValue();
+            if (b == null) continue;
+            if (b.getSrcEntityId() != srcEnemyId) continue;
+            if (this.spatialGrid != null) {
+                this.spatialGrid.remove(entry.getKey());
+            }
+            this.shortIdAllocator.release(entry.getKey());
+            it.remove();
+            reaped++;
+        }
+        if (reaped > 0) {
+            Realm.log.debug("[Reap] dropped {} in-flight bullets from dead enemy {}", reaped, srcEnemyId);
+        }
     }
 
     public long addLootContainer(LootContainer lc) {
@@ -1098,28 +1153,28 @@ public class Realm {
                 if (p.isHiddenFromOthers() && p.getId() != requestingPlayerId) continue;
                 final float dx = p.getPos().x - center.x;
                 final float dy = p.getPos().y - center.y;
-                if (dx * dx + dy * dy <= radiusSq) out.players.add(id);
+                if (dx * dx + dy * dy <= radiusSq) out.getPlayers().add(id);
                 continue;
             }
             final Enemy e = this.enemies.get(id);
             if (e != null) {
                 final float dx = e.getPos().x - center.x;
                 final float dy = e.getPos().y - center.y;
-                if (dx * dx + dy * dy <= radiusSq) out.enemies.add(id);
+                if (dx * dx + dy * dy <= radiusSq) out.getEnemies().add(id);
                 continue;
             }
             final Bullet b = this.bullets.get(id);
             if (b != null) {
                 final float dx = b.getPos().x - center.x;
                 final float dy = b.getPos().y - center.y;
-                if (dx * dx + dy * dy <= radiusSq) out.bullets.add(id);
+                if (dx * dx + dy * dy <= radiusSq) out.getBullets().add(id);
                 continue;
             }
             final Portal portal = this.portals.get(id);
             if (portal != null) {
                 final float dx = portal.getPos().x - center.x;
                 final float dy = portal.getPos().y - center.y;
-                if (dx * dx + dy * dy <= radiusSq) out.portals.add(id);
+                if (dx * dx + dy * dy <= radiusSq) out.getPortals().add(id);
                 continue;
             }
             final LootContainer lc = this.loot.get(id);
@@ -1127,7 +1182,7 @@ public class Realm {
                 final float dx = lc.getPos().x - center.x;
                 final float dy = lc.getPos().y - center.y;
                 if (dx * dx + dy * dy <= radiusSq && lc.isVisibleToPlayer(requestingPlayerId)) {
-                    out.containers.add(id);
+                    out.getContainers().add(id);
                 }
             }
         }
@@ -1137,14 +1192,14 @@ public class Realm {
         final List<Long> outerBulletCandidates = this.spatialGrid.queryRadius(center.x, center.y, bulletRadius);
         for (int i = 0; i < outerBulletCandidates.size(); i++) {
             final long id = outerBulletCandidates.get(i);
-            if (out.bullets.contains(id)) continue;
+            if (out.getBullets().contains(id)) continue;
             final Bullet b = this.bullets.get(id);
             if (b == null) continue;
             final float dx = b.getPos().x - center.x;
             final float dy = b.getPos().y - center.y;
             final float dsq = dx * dx + dy * dy;
             if (dsq <= radiusSq) continue;
-            if (dsq <= bulletRadiusSq) out.bullets.add(id);
+            if (dsq <= bulletRadiusSq) out.getBullets().add(id);
         }
         return out;
     }
@@ -1209,14 +1264,6 @@ public class Realm {
      * caller can apply caps / mark contents-changed re-sends without
      * allocating new collections.
      */
-    public static final class VisibleIds {
-        public final Set<Long> players    = new HashSet<>();
-        public final Set<Long> enemies    = new HashSet<>();
-        public final Set<Long> bullets    = new HashSet<>();
-        public final Set<Long> containers = new HashSet<>();
-        public final Set<Long> portals    = new HashSet<>();
-    }
-
     /**
      * Reset the per-tick NetObjectMovement cache. Called by RealmManagerServer
      * once per realm at the top of enqueueGameData() so subsequent
@@ -2097,7 +2144,7 @@ public class Realm {
             if (dist < currentBestDist) {
                 currentBestDist = dist;
                 best = new Player(d.enemyId, decoy.getPos().clone(),
-                        decoy.getSize(), CharacterClass.TRICKSTER);
+                        decoy.getSize(), CharacterClass.NINJA);
             }
         }
         return best;

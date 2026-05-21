@@ -1,11 +1,14 @@
 package com.openrealm.game.model;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import com.openrealm.game.data.GameDataManager;
 import com.openrealm.game.entity.item.GameItem;
+import com.openrealm.game.entity.item.ItemClass;
 import com.openrealm.game.entity.item.Stats;
+import com.openrealm.game.entity.item.WeaponArchetype;
 import com.openrealm.game.model.ability.AbilityTree;
 import com.openrealm.net.realm.Realm;
 
@@ -36,6 +39,52 @@ public class CharacterClassModel {
      * a class has been ported in Phase 2B; resolution code must tolerate that.
      */
     private AbilityTree abilityTree;
+
+    /**
+     * New item system (2026-05-18) — armor families this class may equip.
+     * List of {@link ItemClass} ids (use the byte form so JSON authoring is
+     * terse). May be null on classes that have not been ported to the new
+     * system yet; {@code CharacterClass.canEquip} falls back to the legacy
+     * targetClass byte in that case.
+     */
+    private List<Byte> allowedArmorClasses;
+
+    /**
+     * New item system (2026-05-18) — weapon families this class may equip.
+     * Drives the Cultist's mixed Robe+Light-weapon rule cleanly: the class
+     * simply lists ROBE_ARMOR + LIGHT_WEAPON across both fields.
+     */
+    private List<Byte> allowedWeaponClasses;
+
+    /**
+     * Optional archetype-level restriction within an allowed weapon class.
+     * The design doc gates each class to a subset of its umbrella (e.g.
+     * Barbarian uses Swords + Axes but not Hammers, all of which share
+     * HEAVY_WEAPON). When null, every archetype in the allowed weapon
+     * classes is permitted.
+     */
+    private List<Byte> allowedWeaponArchetypes;
+
+    /** True iff the player class is permitted to equip the given ItemClass. */
+    public boolean allowsItemClass(ItemClass cls) {
+        if (cls == null || cls == ItemClass.NONE) return false;
+        // UNIVERSAL = any class equips. Used for gauntlets / boots / rings
+        // and other slot-agnostic gear that doesn't care about class.
+        if (cls == ItemClass.UNIVERSAL) return true;
+        if (cls.isWeapon()) {
+            return allowedWeaponClasses != null && allowedWeaponClasses.contains(cls.id);
+        }
+        if (cls.isArmor()) {
+            return allowedArmorClasses != null && allowedArmorClasses.contains(cls.id);
+        }
+        return false;
+    }
+
+    /** Weapon archetype check — null whitelist means "any archetype OK". */
+    public boolean allowsWeaponArchetype(WeaponArchetype arch) {
+        if (allowedWeaponArchetypes == null || allowedWeaponArchetypes.isEmpty()) return true;
+        return arch != null && allowedWeaponArchetypes.contains(arch.id);
+    }
 
     public Stats getRandomLevelUpStats() {
         final ExperienceModel expModel = GameDataManager.EXPERIENCE_LVLS;

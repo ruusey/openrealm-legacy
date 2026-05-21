@@ -6,140 +6,85 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import com.openrealm.game.data.GameDataManager;
 import com.openrealm.game.entity.Player;
+import com.openrealm.game.entity.item.GameItem;
+import com.openrealm.game.entity.item.ItemClass;
+import com.openrealm.game.entity.item.WeaponArchetype;
+import com.openrealm.game.model.CharacterClassModel;
 
+/**
+ * 12 playable classes per the 2026-05-18 design doc rewrite. Three roles per
+ * armor family (DPS / Debuffer / Healer) plus one Specialty per family.
+ * Cultist is mixed: Robe armor + Light weapons (see character-classes.json).
+ *
+ * Equip-eligibility is fully data-driven via {@link CharacterClassModel#getAllowedArmorClasses()}
+ * and {@link CharacterClassModel#getAllowedWeaponClasses()}. The {@link #canEquip}
+ * entry point is the only check now — the legacy targetClass byte path is gone.
+ */
 public enum CharacterClass {
-    ROGUE(0), ARCHER(1), WIZARD(2), PRIEST(3), WARRIOR(4), KNIGHT(5), PALLADIN(6),
-    ASSASSIN(7), NECROMANCER(8), MYSTIC(9), TRICKSTER(10), SORCERER(11), HUNTRESS(12),
-    NINJA(13),
-    // Placeholder heavy-armor "role" classes — Phase 3 role-test scaffolding.
-    // Identical base stats to Knight/Warrior, with kits enforcing a role.
-    HEAVY_DEBUFFER(14), HEAVY_BUFFER(15), HEAVY_DPS(16), HEAVY_ODDBALL(17),
+    // DPS
+    BARBARIAN(0),
+    ASSASSIN(1),
+    WIZARD(2),
+    // Debuffer
+    DUELIST(3),
+    TRAPPER(4),
+    NECROMANCER(5),
+    // Healer / Buffer
+    PALADIN(6),
+    DRUID(7),
+    PRIEST(8),
+    // Specialty
+    KNIGHT(9),
+    NINJA(10),
+    CULTIST(11);
 
-    ROBE(-1), LEATHER(-2), HEAVY(-3), ALL(-4),
-    STAFF_USER(-5), WAND_USER(-6), DAGGER_USER(-7), BOW_USER(-8);
-
-    public static Map<Integer, CharacterClass> map = new HashMap<>();
+    public static final Map<Integer, CharacterClass> map = new HashMap<>();
     static {
         for (CharacterClass cc : CharacterClass.values()) {
             CharacterClass.map.put(cc.classId, cc);
         }
     }
 
-    public int classId;
+    public final int classId;
 
     CharacterClass(int classId) {
         this.classId = classId;
     }
 
     public static List<CharacterClass> getCharacterClasses() {
-        return Arrays.asList(CharacterClass.values()).stream().filter(c -> c.classId >= 0).collect(Collectors.toList());
-    }
-
-    public static boolean isRobeClass(CharacterClass c) {
-        return c.equals(CharacterClass.WIZARD) || c.equals(CharacterClass.PRIEST)
-            || c.equals(CharacterClass.NECROMANCER) || c.equals(CharacterClass.MYSTIC)
-            || c.equals(CharacterClass.SORCERER);
-    }
-
-    public static boolean isLeatherClass(CharacterClass c) {
-        return c.equals(CharacterClass.ARCHER) || c.equals(CharacterClass.ROGUE)
-            || c.equals(CharacterClass.ASSASSIN) || c.equals(CharacterClass.TRICKSTER)
-            || c.equals(CharacterClass.HUNTRESS) || c.equals(CharacterClass.NINJA);
-    }
-
-    public static boolean isHeavyClass(CharacterClass c) {
-        return c.equals(CharacterClass.WARRIOR) || c.equals(CharacterClass.PALLADIN) || c.equals(CharacterClass.KNIGHT)
-            || c.equals(CharacterClass.HEAVY_DEBUFFER) || c.equals(CharacterClass.HEAVY_BUFFER)
-            || c.equals(CharacterClass.HEAVY_DPS) || c.equals(CharacterClass.HEAVY_ODDBALL);
-    }
-
-    public static boolean isPlayerHeavyClass(Player p) {
-        return CharacterClass.isHeavyClass(CharacterClass.valueOf(p.getClassId()));
-    }
-
-    public static boolean isPlayerLeatherClass(Player p) {
-        return CharacterClass.isLeatherClass(CharacterClass.valueOf(p.getClassId()));
-    }
-
-    public static boolean isPlayerRobeClass(Player p) {
-        return CharacterClass.isRobeClass(CharacterClass.valueOf(p.getClassId()));
+        return Arrays.asList(CharacterClass.values()).stream()
+                .filter(c -> c.classId >= 0)
+                .collect(Collectors.toList());
     }
 
     public static CharacterClass getPlayerCharacterClass(Player p) {
         return CharacterClass.valueOf(p.getClassId());
     }
 
-    public static boolean isStaffUser(CharacterClass c) {
-        return c.equals(WIZARD) || c.equals(NECROMANCER) || c.equals(MYSTIC);
-    }
-
-    public static boolean isWandUser(CharacterClass c) {
-        return c.equals(PRIEST) || c.equals(SORCERER);
-    }
-
-    public static boolean isDaggerUser(CharacterClass c) {
-        return c.equals(ROGUE) || c.equals(ASSASSIN) || c.equals(TRICKSTER) || c.equals(NINJA);
-    }
-
-    public static boolean isBowUser(CharacterClass c) {
-        return c.equals(ARCHER) || c.equals(HUNTRESS);
-    }
-
-    public static boolean isValidUser(Player p, byte requiredClass) {
-        // Widen byte to int explicitly so the lookup can't be confused
-        // by sign-extension surprises in any future refactor. valueOf
-        // takes int and our map keys are int, so this is correct.
-        final int reqId = (int) requiredClass;
-        final CharacterClass req = CharacterClass.valueOf(reqId);
-        final CharacterClass playerClass = CharacterClass.getPlayerCharacterClass(p);
-        if (req == null) {
-            // Should never happen — every valid targetClass byte maps to
-            // an enum constant. Log + reject so we don't silently drift.
-            System.err.println("[CharacterClass.isValidUser] Unknown targetClass byte=" + requiredClass
-                    + " (int=" + reqId + ") — rejecting equip for player.classId=" + p.getClassId());
-            return false;
-        }
-        if (playerClass == null) {
-            System.err.println("[CharacterClass.isValidUser] Unknown player.classId=" + p.getClassId()
-                    + " — rejecting equip");
-            return false;
-        }
-        boolean result;
-        switch (req) {
-        case ROBE:        result = CharacterClass.isRobeClass(playerClass); break;
-        case LEATHER:     result = CharacterClass.isLeatherClass(playerClass); break;
-        case HEAVY:       result = CharacterClass.isHeavyClass(playerClass); break;
-        case ALL:         result = true; break;
-        case STAFF_USER:  result = CharacterClass.isStaffUser(playerClass); break;
-        case WAND_USER:   result = CharacterClass.isWandUser(playerClass); break;
-        case DAGGER_USER: result = CharacterClass.isDaggerUser(playerClass); break;
-        case BOW_USER:    result = CharacterClass.isBowUser(playerClass); break;
-        default:
-            // Same-armor-category substitution. Items historically tagged with
-            // a SPECIFIC class (e.g. a sword's targetClass = WARRIOR=4) should
-            // be wearable by every class in the same armor category — that
-            // way the new Heavy_DEBUFFER / _BUFFER / _DPS / _ODDBALL classes
-            // can equip the existing pool of Knight/Warrior/Paladin swords
-            // and armor without the data team having to rewrite every item's
-            // targetClass. Original behavior (exact-class match) is preserved
-            // for cross-category mismatches.
-            if (CharacterClass.isHeavyClass(req) && CharacterClass.isHeavyClass(playerClass)) {
-                result = true;
-            } else if (CharacterClass.isLeatherClass(req) && CharacterClass.isLeatherClass(playerClass)) {
-                result = true;
-            } else if (CharacterClass.isRobeClass(req) && CharacterClass.isRobeClass(playerClass)) {
-                result = true;
-            } else {
-                result = req.equals(playerClass);
-            }
-            break;
-        }
-        return result;
-    }
-
     public static CharacterClass valueOf(int classId) {
         return CharacterClass.map.get(classId);
     }
 
+    /**
+     * Modular equip check. Looks up the player's class model and tests the
+     * item's {@link ItemClass} against the model's allowed lists. Items with
+     * {@code itemClass == NONE} cannot be equipped — the legacy targetClass
+     * fallback was removed 2026-05-18 per the design rewrite.
+     */
+    public static boolean canEquip(Player p, GameItem item) {
+        if (item == null) return false;
+        final ItemClass ic = ItemClass.fromId(item.getItemClass());
+        if (ic == ItemClass.NONE) return false;
+        if (GameDataManager.CHARACTER_CLASSES == null) return false;
+        final CharacterClassModel model = GameDataManager.CHARACTER_CLASSES.get(p.getClassId());
+        if (model == null) return false;
+        if (!model.allowsItemClass(ic)) return false;
+        if (ic.isWeapon()) {
+            final WeaponArchetype arch = WeaponArchetype.fromId(item.getArchetypeId());
+            if (!model.allowsWeaponArchetype(arch)) return false;
+        }
+        return true;
+    }
 }

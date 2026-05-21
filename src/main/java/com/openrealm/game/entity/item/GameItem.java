@@ -59,25 +59,42 @@ public class GameItem extends SpriteModel {
     // Per-instance: applied enchantments (max controlled by rarity)
     @Builder.Default
     private List<Enchantment> enchantments = new ArrayList<>();
-    // Per-instance: rarity tier (orthogonal to power-tier). Drives gem-slot count
-    // and tooltip color. 0=COMMON .. 5=MYTHICAL. See Rarity enum.
+    // Per-instance: rarity tier (orthogonal to power-tier). Drives crystal-slot
+    // count, gem-socket presence, and tooltip color. 0=MUNDANE .. 5=LEGENDARY.
+    // See Rarity enum.
     @Builder.Default
     private byte rarity = 0;
-    // Per-instance: random attribute affixes rolled on drop. Layered on top of
-    // base stats and enchantments at stat-computation time.
+    // Per-instance: random attribute affixes rolled on drop.
     @Builder.Default
     private List<AttributeModifier> attributeModifiers = new ArrayList<>();
-    // Per-template (catalog) override: gem effect type for items in category "gem".
-    // -1 / unset for non-gem items. Used by ServerForgeHelper to translate the
-    // gem item into an Enchantment with the right effectType/magnitude.
+    // Template field. High-level equipment family. Used together with
+    // CharacterClassModel.allowedWeaponClasses / allowedArmorClasses to gate
+    // equip.
     @Builder.Default
-    private byte gemEffectType = -1;
+    private byte itemClass = 0;
+    // Template field. Foreign key into weapon-archetypes.json — the byte id
+    // of the WeaponArchetype this weapon uses.
     @Builder.Default
-    private byte gemParam1 = 0;
+    private byte archetypeId = 0;
+    // Dual-purpose:
+    //   * gem items (category="gem"): identifies which gemstone forging this
+    //     consumable produces, keyed against GemstoneRegistry.
+    //   * equipment instance: id of the gem socketed into this item (set by
+    //     the forge), or 0 for an empty socket. Only EPIC+ items can socket.
     @Builder.Default
-    private short gemMagnitude = 0;
+    private byte gemstoneType = 0;
+    // Per-instance: pixel paint coords for the socketed gem. Only meaningful
+    // when gemstoneType > 0 on an equipment instance.
     @Builder.Default
-    private int gemDurationMs = 0;
+    private byte gemPixelX = 0;
+    @Builder.Default
+    private byte gemPixelY = 0;
+    @Builder.Default
+    private int gemPixelColor = 0;
+    // Template field. Which player stat this item's damage scales off of.
+    // 0=VIT 1=WIS 2=HP 3=MP 4=STR 5=DEF 6=SPD 7=DEX. Defaults to STR.
+    @Builder.Default
+    private byte scalingStat = 4;
 
     public GameItem() {
         this.uid = UUID.randomUUID().toString();
@@ -90,10 +107,13 @@ public class GameItem extends SpriteModel {
         this.enchantments = new ArrayList<>();
         this.rarity = 0;
         this.attributeModifiers = new ArrayList<>();
-        this.gemEffectType = -1;
-        this.gemParam1 = 0;
-        this.gemMagnitude = 0;
-        this.gemDurationMs = 0;
+        this.itemClass = 0;
+        this.archetypeId = 0;
+        this.gemstoneType = 0;
+        this.gemPixelX = 0;
+        this.gemPixelY = 0;
+        this.gemPixelColor = 0;
+        this.scalingStat = 4;
     }
 
     @Override
@@ -104,8 +124,10 @@ public class GameItem extends SpriteModel {
                 .stackable(this.stackable).maxStack(this.maxStack).category(this.category)
                 .forgeStatId(this.forgeStatId).forgeSlotId(this.forgeSlotId).stackCount(this.stackCount)
                 .rarity(this.rarity)
-                .gemEffectType(this.gemEffectType).gemParam1(this.gemParam1)
-                .gemMagnitude(this.gemMagnitude).gemDurationMs(this.gemDurationMs);
+                .itemClass(this.itemClass).archetypeId(this.archetypeId)
+                .gemstoneType(this.gemstoneType)
+                .gemPixelX(this.gemPixelX).gemPixelY(this.gemPixelY).gemPixelColor(this.gemPixelColor)
+                .scalingStat(this.scalingStat);
 
         if (this.damage != null) {
             builder = builder.damage(this.damage.clone());
@@ -153,8 +175,7 @@ public class GameItem extends SpriteModel {
             enchDtos = new ArrayList<>(this.enchantments.size());
             for (Enchantment e : this.enchantments) {
                 enchDtos.add(new EnchantmentDto(
-                        e.getStatId(), e.getDeltaValue(), e.getPixelX(), e.getPixelY(), e.getPixelColor(),
-                        e.getEffectType(), e.getParam1(), e.getMagnitude(), e.getDurationMs()));
+                        e.getStatId(), e.getDeltaValue(), e.getPixelX(), e.getPixelY(), e.getPixelColor()));
             }
         } else {
             enchDtos = null;
@@ -170,7 +191,12 @@ public class GameItem extends SpriteModel {
         }
         return GameItemRefDto.builder().itemId(this.itemId).slotIdx(idx).itemUuid(this.uid)
                 .stackCount(this.stackCount).enchantments(enchDtos)
-                .rarity(this.rarity).attributeModifiers(modDtos).build();
+                .rarity(this.rarity).attributeModifiers(modDtos)
+                .gemstoneType(this.gemstoneType)
+                .gemPixelX(this.gemPixelX)
+                .gemPixelY(this.gemPixelY)
+                .gemPixelColor(this.gemPixelColor)
+                .build();
     }
 
     public NetGameItemRef asNetGameItemRef(int idx) {
@@ -190,21 +216,12 @@ public class GameItem extends SpriteModel {
         if (gameItem.getEnchantments() != null && !gameItem.getEnchantments().isEmpty()) {
             final List<Enchantment> loaded = new ArrayList<>(gameItem.getEnchantments().size());
             for (EnchantmentDto e : gameItem.getEnchantments()) {
-                final byte statId = e.getStatId() == null ? 0 : e.getStatId();
-                final byte delta = e.getDeltaValue() == null ? 0 : e.getDeltaValue();
-                final byte effectType = e.getEffectType() == null ? 0 : e.getEffectType();
-                final byte param1 = e.getParam1() == null ? statId : e.getParam1();
-                final short magnitude = e.getMagnitude() == null ? (short) delta : e.getMagnitude();
                 loaded.add(new Enchantment(
-                        statId,
-                        delta,
+                        e.getStatId() == null ? 0 : e.getStatId(),
+                        e.getDeltaValue() == null ? 0 : e.getDeltaValue(),
                         e.getPixelX() == null ? 0 : e.getPixelX(),
                         e.getPixelY() == null ? 0 : e.getPixelY(),
-                        e.getPixelColor() == null ? 0 : e.getPixelColor(),
-                        effectType,
-                        param1,
-                        magnitude,
-                        e.getDurationMs() == null ? 0 : e.getDurationMs()));
+                        e.getPixelColor() == null ? 0 : e.getPixelColor()));
             }
             item.setEnchantments(loaded);
         } else {
@@ -221,19 +238,29 @@ public class GameItem extends SpriteModel {
         } else {
             item.setAttributeModifiers(new ArrayList<>());
         }
-        // Rarity migration: if persisted rarity is COMMON (0/null) but the item
-        // already carries multiple enchantments, bump rarity so the slot count
-        // accommodates them. Avoids enchantment loss for legacy gear pre-rarity.
+        // Rarity migration: persisted records from the legacy COMMON..MYTHICAL
+        // scale (pre-2026-05-18) may carry more enchantments than the new
+        // rarity slot count permits — bump rarity so the slot cap fits.
         byte rarity = gameItem.getRarity() == null ? 0 : gameItem.getRarity();
         final int enchCount = item.getEnchantments().size();
-        if (rarity == 0 && enchCount > 1) {
-            // enchCount of 2 -> UNCOMMON(1), 3 -> RARE(2), ..., 6 -> MYTHICAL(5)
-            final int idx = Math.min(Rarity.values().length - 1, enchCount - 1);
-            rarity = (byte) idx;
-            log.info("[Rarity] Migrating legacy item {} ({} enchantments) to {}",
+        if (enchCount > Rarity.slotsFor(rarity)) {
+            int newOrd = rarity;
+            while (newOrd < Rarity.values().length - 1
+                    && Rarity.slotsFor(newOrd) < enchCount) {
+                newOrd++;
+            }
+            rarity = (byte) newOrd;
+            log.info("[Rarity] Migrating legacy item {} ({} crystal enchantments) to {}",
                     item.getName(), enchCount, Rarity.fromOrdinal(rarity).displayName);
         }
         item.setRarity(rarity);
+        // Per-instance socketed gem state.
+        if (gameItem.getGemstoneType() != null) {
+            item.setGemstoneType(gameItem.getGemstoneType());
+        }
+        if (gameItem.getGemPixelX() != null)     item.setGemPixelX(gameItem.getGemPixelX());
+        if (gameItem.getGemPixelY() != null)     item.setGemPixelY(gameItem.getGemPixelY());
+        if (gameItem.getGemPixelColor() != null) item.setGemPixelColor(gameItem.getGemPixelColor());
         return item;
     }
 

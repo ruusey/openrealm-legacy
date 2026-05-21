@@ -1307,6 +1307,85 @@ public class ServerCommandHandler {
         }
     }
 
+    /**
+     * Bulk-spawn one weapon per archetype at a chosen tier, or one weapon
+     * across every tier for a chosen archetype. Lets the designer test the
+     * full grid without typing /item 81 times.
+     *
+     * Usage:
+     *   /tierset tier {0-8}              — spawns 9 weapons (all archetypes) at tier
+     *   /tierset arch {sword|axe|hammer|dagger|bow|knife|tome|staff|wand}
+     *                                    — spawns 9 weapons (all tiers) for archetype
+     *   /tierset all                     — spawns all 81 weapons. Use sparingly.
+     */
+    @CommandHandler(value="tierset", description="Bulk-spawn tiered weapons. Usage: /tierset {tier N | arch NAME | all}")
+    @AdminRestrictedCommand(provisions={AccountProvision.OPENREALM_MODERATOR})
+    public static void invokeSpawnTierSet(RealmManagerServer mgr, Player target, ServerCommandMessage message)
+            throws Exception {
+        if (message.getArgs() == null || message.getArgs().isEmpty())
+            throw new IllegalArgumentException("Usage: /tierset {tier N | arch NAME | all}");
+        final Realm targetRealm = mgr.findPlayerRealm(target.getId());
+        final java.util.Map<String,Integer> ARCH_OFFSET = new java.util.HashMap<>();
+        ARCH_OFFSET.put("sword", 0);
+        ARCH_OFFSET.put("axe", 1);
+        ARCH_OFFSET.put("hammer", 2);
+        ARCH_OFFSET.put("dagger", 3);
+        ARCH_OFFSET.put("bow", 4);
+        ARCH_OFFSET.put("knife", 5);
+        ARCH_OFFSET.put("chakram", 5);
+        ARCH_OFFSET.put("kunai", 5);
+        ARCH_OFFSET.put("tome", 6);
+        ARCH_OFFSET.put("book", 6);
+        ARCH_OFFSET.put("staff", 7);
+        ARCH_OFFSET.put("wand", 8);
+        final String mode = message.getArgs().get(0).toLowerCase();
+        final java.util.List<Integer> ids = new java.util.ArrayList<>();
+        if ("tier".equals(mode)) {
+            if (message.getArgs().size() < 2)
+                throw new IllegalArgumentException("Usage: /tierset tier {0-8}");
+            final int tier = Math.max(0, Math.min(8, Integer.parseInt(message.getArgs().get(1))));
+            for (int off = 0; off < 9; off++) ids.add(3000 + tier*100 + off);
+        } else if ("arch".equals(mode)) {
+            if (message.getArgs().size() < 2)
+                throw new IllegalArgumentException("Usage: /tierset arch {sword|axe|hammer|dagger|bow|knife|tome|staff|wand}");
+            final Integer off = ARCH_OFFSET.get(message.getArgs().get(1).toLowerCase());
+            if (off == null)
+                throw new IllegalArgumentException("Unknown archetype. Use sword/axe/hammer/dagger/bow/knife/tome/staff/wand");
+            for (int t = 0; t < 9; t++) ids.add(3000 + t*100 + off);
+        } else if ("all".equals(mode)) {
+            for (int t = 0; t < 9; t++) for (int o = 0; o < 9; o++) ids.add(3000 + t*100 + o);
+        } else {
+            throw new IllegalArgumentException("Usage: /tierset {tier N | arch NAME | all}");
+        }
+        // Resolve all templates first so we can skip missing IDs cleanly instead
+        // of stuffing nulls into LootContainers (which renders as phantom slots
+        // on the client). Log any misses up-front so the test loop surfaces
+        // missing catalog entries instead of silently dropping the loot bag.
+        final java.util.List<GameItem> resolved = new java.util.ArrayList<>();
+        final java.util.List<Integer> missing = new java.util.ArrayList<>();
+        for (final Integer iid : ids) {
+            final GameItem tmpl = GameDataManager.GAME_ITEMS.get(iid);
+            if (tmpl == null) { missing.add(iid); continue; }
+            resolved.add(tmpl.clone());
+        }
+        if (!missing.isEmpty()) {
+            log.warn("[/tierset] {} items missing from GAME_ITEMS: {}", missing.size(), missing);
+        }
+        int spawned = 0;
+        while (spawned < resolved.size()) {
+            int bagSize = Math.min(8, resolved.size() - spawned);
+            GameItem[] bag = new GameItem[bagSize];
+            for (int i = 0; i < bagSize; i++) bag[i] = resolved.get(spawned + i);
+            targetRealm.addLootContainer(new LootContainer(LootTier.BROWN,
+                    target.getPos().clone(Realm.RANDOM.nextInt(48) - 24, Realm.RANDOM.nextInt(48) - 24),
+                    bag));
+            spawned += bagSize;
+        }
+        final String msg = "Spawned " + resolved.size() + "/" + ids.size() + " tier weapons"
+                + (missing.isEmpty() ? "." : ". Missing IDs: " + missing);
+        mgr.enqueueServerPacket(target, TextPacket.from("SYSTEM", target.getName(), msg));
+    }
+
     @CommandHandler(value="portal", description="Spawn a portal to a map by id OR name. Usage: /portal {MAP_ID_OR_NAME}")
 	@AdminRestrictedCommand(provisions={AccountProvision.OPENREALM_MODERATOR})
     public static void invokeSpawnPortal(RealmManagerServer mgr, Player target, ServerCommandMessage message)
@@ -1736,7 +1815,7 @@ public class ServerCommandHandler {
     public static void invokeSetRarity(RealmManagerServer mgr, Player target, ServerCommandMessage message)
             throws Exception {
         if (message.getArgs() == null || message.getArgs().size() < 2)
-            throw new IllegalArgumentException("Usage: /rarity {SLOT 0-3} {0-5 | COMMON..MYTHICAL}");
+            throw new IllegalArgumentException("Usage: /rarity {SLOT 0-3} {0-5 | MUNDANE..LEGENDARY}");
         final int slot = Integer.parseInt(message.getArgs().get(0));
         if (slot < 0 || slot > 3) throw new IllegalArgumentException("Slot must be 0-3 (equipment).");
         final GameItem item = target.getInventory()[slot];
@@ -1751,7 +1830,8 @@ public class ServerCommandHandler {
         item.setRarity((byte) r.ordinal());
         log.info("[Admin] {} set rarity of {} to {}", target.getName(), item.getName(), r.displayName);
         mgr.enqueueServerPacket(target, TextPacket.from("SYSTEM", target.getName(),
-                item.getName() + " is now " + r.displayName + " (" + r.gemSlots + " gem slots)"));
+                item.getName() + " is now " + r.displayName + " (" + r.crystalSlots + " crystal slots"
+                        + (r.hasGemSocket() ? ", +1 gem socket" : "") + ")"));
         final UpdatePacket update =
                 mgr.findPlayerRealm(target.getId()).getPlayerAsPacket(target.getId());
         if (update != null) mgr.enqueueServerPacket(target, update);
@@ -1784,35 +1864,58 @@ public class ServerCommandHandler {
         mgr.persistPlayerAsync(target);
     }
 
-    @CommandHandler(value="setench", description="Add a typed enchantment to an equipped item. Usage: /setench {SLOT} {EFFECT 0-6} {PARAM} {MAGNITUDE} [DURATION_MS]")
+    @CommandHandler(value="setench", description="Add a stat-delta enchantment to an equipped item. Usage: /setench {SLOT} {STAT 0-7} {DELTA -127..127}")
     @AdminRestrictedCommand(provisions={AccountProvision.OPENREALM_MODERATOR})
     public static void invokeSetEnchantment(RealmManagerServer mgr, Player target, ServerCommandMessage message)
             throws Exception {
-        if (message.getArgs() == null || message.getArgs().size() < 4)
+        if (message.getArgs() == null || message.getArgs().size() < 3)
             throw new IllegalArgumentException(
-                "Usage: /setench {SLOT} {EFFECT 0=STAT_DELTA 1=STAT_SCALE 2=PROJ_COUNT 3=PROJ_DAMAGE 4=ON_HIT 5=LIFESTEAL 6=CRIT} {PARAM1} {MAGNITUDE} [DURATION_MS]");
+                "Usage: /setench {SLOT 0-3} {STAT 0=VIT 1=WIS 2=HP 3=MP 4=STR 5=DEF 6=SPD 7=DEX} {DELTA}");
         final int slot = Integer.parseInt(message.getArgs().get(0));
-        final int effect = Integer.parseInt(message.getArgs().get(1));
-        final int param1 = Integer.parseInt(message.getArgs().get(2));
-        final int magnitude = Integer.parseInt(message.getArgs().get(3));
-        final int duration = message.getArgs().size() >= 5 ? Integer.parseInt(message.getArgs().get(4)) : 0;
+        final int statId = Integer.parseInt(message.getArgs().get(1));
+        final int delta = Integer.parseInt(message.getArgs().get(2));
         if (slot < 0 || slot > 3) throw new IllegalArgumentException("Slot must be 0-3.");
-        if (effect < 0 || effect > 6) throw new IllegalArgumentException("Effect 0-6.");
+        if (statId < 0 || statId > 7) throw new IllegalArgumentException("Stat must be 0-7.");
+        if (delta < Byte.MIN_VALUE || delta > Byte.MAX_VALUE)
+            throw new IllegalArgumentException("Delta out of byte range.");
         final GameItem item = target.getInventory()[slot];
         if (item == null) throw new IllegalArgumentException("Slot " + slot + " is empty.");
         if (item.getEnchantments() == null) item.setEnchantments(new ArrayList<>());
         if (item.getEnchantments().size() >= item.getMaxEnchantments())
-            throw new IllegalArgumentException("Item at rarity gem-slot cap (" + item.getMaxEnchantments() + ").");
-        final Enchantment e = new Enchantment(
-                (byte) (effect == 0 ? param1 : 0),
-                (byte) (effect == 0 ? Math.max(Byte.MIN_VALUE, Math.min(Byte.MAX_VALUE, magnitude)) : 0),
-                (byte) 0, (byte) 0, 0xFFFFFFFF,
-                (byte) effect, (byte) param1, (short) magnitude, duration);
+            throw new IllegalArgumentException("Item at rarity cap (" + item.getMaxEnchantments() + ").");
+        final Enchantment e = new Enchantment((byte) statId, (byte) delta, (byte) 0, (byte) 0, 0xFFFFFFFF);
         item.getEnchantments().add(e);
-        log.info("[Admin] {} added enchantment effect={} param={} mag={} to {}",
-                target.getName(), effect, param1, magnitude, item.getName());
+        log.info("[Admin] {} added enchantment stat={} delta={} to {}",
+                target.getName(), statId, delta, item.getName());
         mgr.enqueueServerPacket(target, TextPacket.from("SYSTEM", target.getName(),
                 "Forged " + item.getName() + " (slots " + item.getEnchantments().size() + "/" + item.getMaxEnchantments() + ")"));
+        final UpdatePacket update =
+                mgr.findPlayerRealm(target.getId()).getPlayerAsPacket(target.getId());
+        if (update != null) mgr.enqueueServerPacket(target, update);
+        mgr.persistPlayerAsync(target);
+    }
+
+    @CommandHandler(value="setgem", description="Socket a gemstone into an equipped item. Usage: /setgem {SLOT 0-3} {GEMSTONE_TYPE} (0 = clear)")
+    @AdminRestrictedCommand(provisions={AccountProvision.OPENREALM_MODERATOR})
+    public static void invokeSetGem(RealmManagerServer mgr, Player target, ServerCommandMessage message)
+            throws Exception {
+        if (message.getArgs() == null || message.getArgs().size() < 2)
+            throw new IllegalArgumentException(
+                "Usage: /setgem {SLOT 0-3} {GEMSTONE_TYPE} — see GemstoneRegistry for ids. 0 clears.");
+        final int slot = Integer.parseInt(message.getArgs().get(0));
+        final int gType = Integer.parseInt(message.getArgs().get(1));
+        if (slot < 0 || slot > 3) throw new IllegalArgumentException("Slot must be 0-3.");
+        if (gType < 0 || gType > 127) throw new IllegalArgumentException("Gemstone type byte range.");
+        final GameItem item = target.getInventory()[slot];
+        if (item == null) throw new IllegalArgumentException("Slot " + slot + " is empty.");
+        item.setGemstoneType((byte) gType);
+        item.setGemPixelX((byte) 0);
+        item.setGemPixelY((byte) 0);
+        item.setGemPixelColor(0xFFFFFFFF);
+        log.info("[Admin] {} set gemstoneType={} on {}", target.getName(), gType, item.getName());
+        mgr.enqueueServerPacket(target, TextPacket.from("SYSTEM", target.getName(),
+                gType == 0 ? "Cleared gem on " + item.getName()
+                           : "Socketed gem " + gType + " into " + item.getName()));
         final UpdatePacket update =
                 mgr.findPlayerRealm(target.getId()).getPlayerAsPacket(target.getId());
         if (update != null) mgr.enqueueServerPacket(target, update);

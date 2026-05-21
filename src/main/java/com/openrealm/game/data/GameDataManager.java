@@ -32,6 +32,7 @@ import com.openrealm.game.model.RealmEventModel;
 import com.openrealm.game.model.SetPieceModel;
 import com.openrealm.game.model.TerrainGenerationParameters;
 import com.openrealm.game.model.TileModel;
+import com.openrealm.game.model.WeaponArchetypeModel;
 import com.openrealm.net.core.IOService;
 import com.openrealm.net.server.ServerGameLogic;
 
@@ -63,6 +64,10 @@ public class GameDataManager {
 	// Phase 2A transition; resolution code must tolerate that.
 	public static Map<Integer, Ability>                       ABILITIES = null;
 	public static Map<Integer, PassiveAbility>                PASSIVES = null;
+	// Phase 3 — data-driven weapon archetype gameplay. Indexed by the
+	// WeaponArchetype enum's byte id. See WeaponArchetypeModel for the
+	// schema. Items inherit scalingStat from here at catalog-load time.
+	public static Map<Byte, WeaponArchetypeModel>             WEAPON_ARCHETYPES = null;
 
 	/**
 	 * Locate a game-data file. Order of precedence:
@@ -405,6 +410,62 @@ public class GameDataManager {
 		GameDataManager.log.info("Loading Game Items... DONE");
 	}
 
+	private static void loadWeaponArchetypes(final boolean remote) throws Exception {
+		GameDataManager.log.info("Loading Weapon Archetypes...");
+		GameDataManager.WEAPON_ARCHETYPES = new HashMap<>();
+		String text = null;
+		if (remote) {
+			text = ServerGameLogic.DATA_SERVICE.executeGet("game-data/weapon-archetypes.json", null);
+		} else {
+			InputStream inputStream = openLocalData("weapon-archetypes.json");
+			if (inputStream == null) {
+				GameDataManager.log.info("Loading Weapon Archetypes... DONE (no local file, empty table)");
+				return;
+			}
+			text = new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
+		}
+		if (text == null || text.isBlank() || text.trim().equals("[]")) {
+			GameDataManager.log.info("Loading Weapon Archetypes... DONE (empty)");
+			return;
+		}
+		WeaponArchetypeModel[] models =
+				GameDataManager.JSON_MAPPER.readValue(text, WeaponArchetypeModel[].class);
+		for (WeaponArchetypeModel m : models) {
+			GameDataManager.WEAPON_ARCHETYPES.put(m.getId(), m);
+		}
+		GameDataManager.log.info("Loading Weapon Archetypes... DONE ({} entries)",
+				GameDataManager.WEAPON_ARCHETYPES.size());
+	}
+
+	/**
+	 * After {@link #loadGameItems} and {@link #loadWeaponArchetypes} have both
+	 * landed, walk every item that declares a weaponArchetype and inherit
+	 * gameplay-shape fields the JSON didn't set. Currently inherits scalingStat
+	 * only — combat-time fields (attackSpeedMul / damageMul / rangeMul / etc.)
+	 * are looked up live at fire time so balance edits don't need a reload.
+	 *
+	 * Inheritance rule: if the item's scalingStat is still the default STR(4)
+	 * AND the archetype's scaling stat is different, take the archetype's.
+	 * Items that explicitly set a non-STR scalingStat keep it.
+	 */
+	private static void applyWeaponArchetypeDefaults() {
+		if (GameDataManager.GAME_ITEMS == null || GameDataManager.WEAPON_ARCHETYPES == null) return;
+		int inherited = 0;
+		for (GameItem item : GameDataManager.GAME_ITEMS.values()) {
+			final byte arch = item.getArchetypeId();
+			if (arch <= 0) continue;
+			final WeaponArchetypeModel m = GameDataManager.WEAPON_ARCHETYPES.get(arch);
+			if (m == null) continue;
+			if (item.getScalingStat() == (byte) 4 && m.getScalingStat() != (byte) 4) {
+				item.setScalingStat(m.getScalingStat());
+				inherited++;
+			}
+		}
+		if (inherited > 0) {
+			GameDataManager.log.info("Weapon Archetypes: inherited scalingStat on {} items", inherited);
+		}
+	}
+
 	public static Map<Integer, GameItem> getStartingEquipment(final CharacterClass characterClass) {
 		final CharacterClassModel model = GameDataManager.CHARACTER_CLASSES.get(characterClass.classId);
 		return model.getStartingEquipmentMap();
@@ -480,9 +541,17 @@ public class GameDataManager {
 			() -> { try { GameDataManager.loadRealmEvents(loadRemote); } catch (Exception e) { GameDataManager.log.error("Failed to load realm events: {}", e.getMessage()); } },
 			() -> { try { GameDataManager.loadAbilities(loadRemote); } catch (Exception e) { GameDataManager.log.error("Failed to load abilities: {}", e.getMessage()); } },
 			() -> { try { GameDataManager.loadPassives(loadRemote); } catch (Exception e) { GameDataManager.log.error("Failed to load passives: {}", e.getMessage()); } },
+			() -> { try { GameDataManager.loadWeaponArchetypes(loadRemote); } catch (Exception e) { GameDataManager.log.error("Failed to load weapon archetypes: {}", e.getMessage()); } },
 		};
 		for (Runnable loader : loaders) {
 			loader.run();
+		}
+		// Post-load enrichment — needs both GAME_ITEMS and WEAPON_ARCHETYPES
+		// populated, so run after every loader.
+		try {
+			GameDataManager.applyWeaponArchetypeDefaults();
+		} catch (Exception e) {
+			GameDataManager.log.error("Failed to apply weapon archetype defaults: {}", e.getMessage());
 		}
 		try {
 			IOService.mapSerializableData();

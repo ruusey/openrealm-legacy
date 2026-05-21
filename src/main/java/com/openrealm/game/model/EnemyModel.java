@@ -35,10 +35,11 @@ public class EnemyModel extends SpriteModel {
      */
     private List<Short> permanentEffects;
     /**
-     * Weights for COMMON, UNCOMMON, RARE, EPIC, LEGENDARY, MYTHICAL drops on this
-     * enemy. Optional — when null/missing, {@link com.openrealm.game.model.LootRarityRoller}
-     * derives a default table from the enemy's tier (high-tier enemies skew toward
-     * higher-rarity drops). Sum is normalized at roll time so any positive weights work.
+     * Weights for MUNDANE, COMMON, UNCOMMON, RARE, EPIC, LEGENDARY drops on this
+     * enemy (Rarity-ordinal order). Optional — when null/missing,
+     * {@link com.openrealm.game.model.LootRarityRoller} derives a default table
+     * from the enemy's tier (high-tier enemies skew toward higher-rarity drops).
+     * Sum is normalized at roll time so any positive weights work.
      */
     private List<Float> rarityWeights;
 }

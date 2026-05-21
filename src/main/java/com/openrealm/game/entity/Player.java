@@ -20,6 +20,8 @@ import com.openrealm.game.data.GameDataManager;
 import com.openrealm.game.entity.item.AttributeModifier;
 import com.openrealm.game.entity.item.Enchantment;
 import com.openrealm.game.entity.item.GameItem;
+import com.openrealm.game.entity.item.gem.Gemstone;
+import com.openrealm.game.entity.item.gem.GemstoneRegistry;
 import com.openrealm.game.entity.item.LootContainer;
 import com.openrealm.game.entity.item.Stats;
 import com.openrealm.game.metrics.PlayerMetrics;
@@ -509,13 +511,14 @@ public class Player extends Entity {
 			// doubled for the duration of the buff.
 			float mpMult = 1.0f;
 			if (this.hasEffect(StatusEffectType.MANA_FOUNT)) mpMult = 2.0f;
-			// "Muscle for Brains" (Heavy DPS, passive 11016) swaps the regen
-			// driver from WIS to STR. A heavy-armor warrior gets MP back from
-			// their physical stat rather than the magic stat they don't invest
-			// in. Any other class regens off WIS as before.
+			// "Muscle for Brains" — passive 11016 (legacy Heavy DPS) and 12000
+			// (Barbarian, 2026-05-18 class rewrite) both swap the regen driver
+			// from WIS to STR so heavy-armor classes get MP back from their
+			// physical stat. Any other class regens off WIS as before.
 			final PassiveAbility classPassive = this.getClassPassive();
-			final int regenStat = (classPassive != null && classPassive.getId() == 11016)
-					? stats.getStr() : stats.getWis();
+			final int passiveId = classPassive != null ? classPassive.getId() : -1;
+			final boolean strRegen = passiveId == 11016 || passiveId == 12000;
+			final int regenStat = strRegen ? stats.getStr() : stats.getWis();
 			final int regen = (int) ((0.12f * (regenStat + 4.2f)) * mpMult);
 			if (this.getMana() < stats.getMp()) {
 				int targetMana = this.getMana() + regen;
@@ -532,11 +535,6 @@ public class Player extends Entity {
 			return new Stats();
 		Stats stats = this.stats.clone();
 		GameItem[] equipment = this.getSlots(0, EQUIPMENT_SLOT_COUNT);
-		// Two-pass to keep STAT_SCALE multipliers honest: first sum all
-		// additive contributions (item stats, attribute modifiers, STAT_DELTA
-		// enchantments), then apply scale percentages on the post-additive
-		// totals so a "+10% wisdom" gem stacks predictably with raw +WIS.
-		int[] scalePctByStat = new int[8];
 		for (GameItem item : equipment) {
 			if (item == null) continue;
 			stats = stats.concat(item.getStats());
@@ -547,29 +545,12 @@ public class Player extends Entity {
 			}
 			if (item.getEnchantments() != null) {
 				for (Enchantment e : item.getEnchantments()) {
-					final byte effectType = e.getEffectType();
-					if (effectType == 0 /* STAT_DELTA */) {
-						// param1=statId, magnitude=delta (legacy uses statId/deltaValue)
-						final byte sid = (byte) (e.getParam1() != 0 || e.getMagnitude() != 0 ? e.getParam1() : e.getStatId());
-						final short delta = e.getMagnitude() != 0 ? e.getMagnitude() : (short) e.getDeltaValue();
-						applyStatDelta(stats, sid, delta);
-					} else if (effectType == 1 /* STAT_SCALE */) {
-						final int sid = e.getParam1();
-						if (sid >= 0 && sid < 8) scalePctByStat[sid] += e.getMagnitude();
-					}
-					// Other effectTypes (PROJECTILE_*, ON_HIT_*, LIFESTEAL, CRIT)
-					// are combat-time and applied at projectile-spawn / damage-roll.
+					applyStatDelta(stats, e.getStatId(), e.getDeltaValue());
 				}
 			}
+			final Gemstone g = GemstoneRegistry.forItem(item);
+			if (g != null) g.modifyStats(stats, this, item);
 		}
-		if (scalePctByStat[0] != 0) stats.setVit((short) (stats.getVit() + (stats.getVit() * scalePctByStat[0]) / 100));
-		if (scalePctByStat[1] != 0) stats.setWis((short) (stats.getWis() + (stats.getWis() * scalePctByStat[1]) / 100));
-		if (scalePctByStat[2] != 0) stats.setHp(stats.getHp() + (stats.getHp() * scalePctByStat[2]) / 100);
-		if (scalePctByStat[3] != 0) stats.setMp((short) (stats.getMp() + (stats.getMp() * scalePctByStat[3]) / 100));
-		if (scalePctByStat[4] != 0) stats.setStr((short) (stats.getStr() + (stats.getStr() * scalePctByStat[4]) / 100));
-		if (scalePctByStat[5] != 0) stats.setDef((short) (stats.getDef() + (stats.getDef() * scalePctByStat[5]) / 100));
-		if (scalePctByStat[6] != 0) stats.setSpd((short) (stats.getSpd() + (stats.getSpd() * scalePctByStat[6]) / 100));
-		if (scalePctByStat[7] != 0) stats.setDex((short) (stats.getDex() + (stats.getDex() * scalePctByStat[7]) / 100));
 		if (this.hasEffect(StatusEffectType.ARMOR_BROKEN)) {
 			stats.setDef((short) 0);
 		}

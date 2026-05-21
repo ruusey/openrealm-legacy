@@ -25,11 +25,4 @@ public class EnchantmentDto implements Serializable {
     private Byte pixelX;
     private Byte pixelY;
     private Integer pixelColor;
-    // Generalized typed-effect fields (P4). Null on legacy persisted records;
-    // GameItem.fromGameItemRef defaults effectType=0 (STAT_DELTA) when null,
-    // mapping legacy stat-only enchantments into the new pipeline cleanly.
-    private Byte effectType;
-    private Byte param1;
-    private Short magnitude;
-    private Integer durationMs;
 }

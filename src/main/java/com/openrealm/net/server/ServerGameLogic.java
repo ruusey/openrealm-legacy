@@ -26,15 +26,20 @@ import com.openrealm.game.entity.Bullet;
 import com.openrealm.game.entity.Enemy;
 import com.openrealm.game.entity.Player;
 import com.openrealm.game.entity.Portal;
-import com.openrealm.game.entity.item.CombatModifiers;
 import com.openrealm.game.entity.item.GameItem;
+import com.openrealm.game.entity.item.Stats;
+import com.openrealm.game.entity.item.gem.Gemstone;
+import com.openrealm.game.entity.item.gem.GemstoneRegistry;
+import com.openrealm.game.entity.item.gem.ShotContext;
 import com.openrealm.game.math.Vector2f;
 import com.openrealm.game.model.DungeonGenerationParams;
 import com.openrealm.game.model.DungeonGraphNode;
 import com.openrealm.game.model.MapModel;
+import com.openrealm.game.model.WeaponArchetypeModel;
 import com.openrealm.game.model.ability.AbilityScaling;
 import com.openrealm.game.model.ability.PassiveAbility;
 import com.openrealm.game.model.ability.PassiveTrigger;
+import com.openrealm.game.contants.ProjectileFlag;
 import com.openrealm.net.client.packet.CreateEffectPacket;
 import java.util.Set;
 import com.openrealm.game.model.PortalModel;
@@ -46,6 +51,8 @@ import com.openrealm.net.Packet;
 import com.openrealm.net.messaging.CommandType;
 import com.openrealm.net.messaging.LoginRequestMessage;
 import com.openrealm.net.messaging.LoginResponseMessage;
+import com.openrealm.net.realm.PendingRealmJoin;
+import com.openrealm.net.realm.PendingRealmTransition;
 import com.openrealm.net.realm.Realm;
 import com.openrealm.net.realm.RealmManagerServer;
 import com.openrealm.net.server.packet.CommandPacket;
@@ -400,7 +407,7 @@ public class ServerGameLogic {
 					log.info("[SERVER] Async realm generation complete for player {} (mapId={}, node={})",
 						user.getName(), mapId, resolvedNodeId);
 
-					mgr.enqueuePendingTransition(new RealmManagerServer.PendingRealmTransition(
+					mgr.enqueuePendingTransition(new PendingRealmTransition(
 						generatedRealm, user, finalCurrentRealm, finalUsedPortal));
 				} catch (Exception e) {
 					log.error("[SERVER] Async realm generation failed for player {}. Reason: {}",
@@ -602,6 +609,13 @@ public class ServerGameLogic {
 		boolean canShoot = false;
 		if (realm.getPlayerLastShotTime().get(player.getId()) != null) {
 			double dex = (int) ((6.5 * (player.getComputedStats().getDex() + 17.3)) / 75);
+			// Weapon-archetype fire-rate multiplier. Heavy weapons swing slow,
+			// daggers swing fast — see weapon-archetypes.json. Applies before
+			// status buffs so BERSERK on a hammer still feels hammer-y.
+			final WeaponArchetypeModel archForRate = archetypeFor(player.getInventory()[0]);
+			if (archForRate != null && archForRate.getAttackSpeedMul() > 0f) {
+				dex = dex * archForRate.getAttackSpeedMul();
+			}
 			// BERSERK = +50% fire rate. SPEEDY no longer affects fire rate
 			// (movement-only). Use BERSERK for any "attack faster" buff.
 			if (player.hasEffect(StatusEffectType.BERSERK)) {
@@ -657,13 +671,17 @@ public class ServerGameLogic {
 					.map(String::valueOf).reduce((a,b)->a+","+b).orElse("none"));
 				return;
 			}
-			final CombatModifiers cm =
-					CombatModifiers.fromItem(player.getInventory()[0]);
+			final GameItem weapon = player.getInventory()[0];
+			final ShotContext ctx = new ShotContext();
+			final Gemstone weaponGem = GemstoneRegistry.forItem(weapon);
+			if (weaponGem != null) {
+				weaponGem.modifyShot(ctx, player, weapon);
+				weaponGem.onBasicAttack(player, weapon);
+			}
 			// Lifetime metric — count every bullet leaving the muzzle,
-			// including extra-projectile gear-bonus shots. Hit/miss are
-			// derived later from the bullet's death event (Phase 2).
+			// including extra-projectile gear-bonus shots.
 			if (player.getMetrics() != null) {
-				final int bullets = 1 + (cm == null ? 0 : cm.getExtraProjectiles());
+				final int bullets = 1 + ctx.getExtraProjectiles();
 				for (int b = 0; b < bullets; b++) {
 					player.getMetrics().recordProjectileFired();
 				}
@@ -705,40 +723,63 @@ public class ServerGameLogic {
 			}
 
 			float angle = Bullet.getAngle(source, dest);
+			final WeaponArchetypeModel arch = archetypeFor(player.getInventory()[0]);
 			for (Projectile proj : group.getProjectiles()) {
 				short offset = (short) (player.getSize() / (short) 2);
 				short rolledDamage = player.getInventory()[0].getDamage().getInRange();
 				float shootAngle = angle + Float.parseFloat(proj.getAngle());
-				rolledDamage += player.getComputedStats().getStr();
-				rolledDamage = applyCombatDamageMods(rolledDamage, cm);
+				// Weapon scaling — scale off the weapon's configured stat
+				// (GameItem.scalingStat; default 4=STR preserves legacy behavior).
+				rolledDamage += statByIndex(player.getComputedStats(),
+						player.getInventory()[0].getScalingStat());
+				// Archetype damage multiplier (hammers hit harder, daggers softer).
+				if (arch != null && arch.getDamageMul() != 1.0f) {
+					rolledDamage = (short) Math.min(Short.MAX_VALUE,
+							Math.max(0, (int) (rolledDamage * arch.getDamageMul())));
+				}
+				rolledDamage = applyShotDamageMods(rolledDamage, ctx);
 				if (empoweredShot) {
 					rolledDamage = (short) Math.min(Short.MAX_VALUE, (int) (rolledDamage * 1.5f));
 				}
-				// MultiShot / extra-projectile gems: fire (1 + extra) bullets fanned
-				// SYMMETRICALLY around the cursor — half the spread on each side.
-				// The previous formula biased the fan one-sided (primary at base
-				// angle, extras only on alternating sides starting with the left),
-				// so even with one extra the cursor sat on one bullet instead of
-				// between the two streams. Mirrors the centered pattern used by
-				// ability-bullet fan in RealmManagerServer.
-				final int totalBullets = 1 + cm.getExtraProjectiles();
-				final float SPREAD = 0.12f;
+				// Total bullets = archetype's built-in multi-shot count + gem extras.
+				final int archCount = (arch == null) ? 1 : Math.max(1, arch.getProjectileCount());
+				final int totalBullets = archCount + ctx.getExtraProjectiles();
+				final float SPREAD = ((arch != null && arch.getSpreadRad() > 0f)
+						? arch.getSpreadRad() : 0.12f) + ctx.getExtraSpread();
 				for (int i = 0; i < totalBullets; i++) {
 					final float deltaA = (i - (totalBullets - 1) / 2f) * SPREAD;
-					final short dmg = (i == 0) ? rolledDamage : applyCombatDamageMods(rolledDamage, cm);
+					final short dmg = (i == 0) ? rolledDamage : applyShotDamageMods(rolledDamage, ctx);
 					spawnPlayerBullet(mgr, realm.getRealmId(), player, weaponPgId, proj,
-							source.clone(-offset, -offset), shootAngle + deltaA, dmg, cm);
+							source.clone(-offset, -offset), shootAngle + deltaA, dmg, ctx, arch);
 				}
 			}
 		}
 	}
 
-	private static short applyCombatDamageMods(short base, CombatModifiers cm) {
+	/** Stat lookup by GameItem.scalingStat / Enchantment statId convention:
+	 *  0=VIT 1=WIS 2=HP 3=MP 4=STR 5=DEF 6=SPD 7=DEX. Matches the index
+	 *  used by RealmManagerServer.statByIndex / AbilityScaling.statIndex. */
+	private static int statByIndex(Stats s, int idx) {
+		if (s == null) return 0;
+		switch (idx) {
+			case 0: return s.getVit();
+			case 1: return s.getWis();
+			case 2: return s.getHp();
+			case 3: return s.getMp();
+			case 4: return s.getStr();
+			case 5: return s.getDef();
+			case 6: return s.getSpd();
+			case 7: return s.getDex();
+			default: return s.getStr();
+		}
+	}
+
+	private static short applyShotDamageMods(short base, ShotContext ctx) {
 		int dmg = base;
-		if (cm.getDamagePct() != 0) dmg = dmg + (dmg * cm.getDamagePct()) / 100;
-		if (cm.getCritChancePct() > 0) {
+		if (ctx.getDamagePct() != 0) dmg = dmg + (dmg * ctx.getDamagePct()) / 100;
+		if (ctx.getCritChancePct() > 0) {
 			final int roll = (int) (Math.random() * 100);
-			if (roll < cm.getCritChancePct()) dmg = dmg * 2;
+			if (roll < ctx.getCritChancePct()) dmg = dmg * 2;
 		}
 		if (dmg < 0) dmg = 0;
 		if (dmg > Short.MAX_VALUE) dmg = Short.MAX_VALUE;
@@ -747,24 +788,53 @@ public class ServerGameLogic {
 
 	private static void spawnPlayerBullet(RealmManagerServer mgr, long realmId, Player player, int weaponPgId,
 			Projectile proj, Vector2f src, float angle, short damage,
-			CombatModifiers cm) {
+			ShotContext ctx, WeaponArchetypeModel arch) {
+		// Archetype range multiplier — staves outshoot daggers.
+		float range = proj.getRange();
+		if (arch != null && arch.getRangeMul() != 1.0f) {
+			range = range * arch.getRangeMul();
+		}
+		// Piercing — archetype OR gemstone flag, additive with the projectile's
+		// own flag list (don't double-add).
+		List<Short> flags = proj.getFlags();
+		final boolean wantPierce = (arch != null && arch.isPiercing()) || ctx.isPiercing();
+		if (wantPierce) {
+			final short pierceFlag = ProjectileFlag.PASS_THROUGH_ENEMIES.flagId;
+			boolean already = false;
+			if (flags != null) {
+				for (Short f : flags) { if (f != null && f.shortValue() == pierceFlag) { already = true; break; } }
+			}
+			if (!already) {
+				flags = (flags == null) ? new ArrayList<>() : new ArrayList<>(flags);
+				flags.add(pierceFlag);
+			}
+		}
 		final Bullet b = mgr.addProjectile(realmId, Realm.RANDOM.nextLong(), player.getId(), weaponPgId,
 				proj.getProjectileId(), src, angle, proj.getSize(),
-				proj.getMagnitude(), proj.getRange(), damage, false, proj.getFlags(), proj.getAmplitude(),
+				proj.getMagnitude(), range, damage, false, flags, proj.getAmplitude(),
 				proj.getFrequency(), player.getId());
 		if (b == null) return;
-		mergeProjectileEffects(b, proj, cm);
+		mergeProjectileEffects(b, proj, ctx);
 	}
 
-	private static void mergeProjectileEffects(Bullet b, Projectile proj,
-			CombatModifiers cm) {
-		// Merge base projectile effects with any gem on-hit effects on the firing item.
+	/** Look up the weapon-archetype model for the firing item, or null if
+	 *  the item has no archetype set or the model isn't loaded. */
+	private static WeaponArchetypeModel archetypeFor(GameItem item) {
+		if (item == null) return null;
+		final byte a = item.getArchetypeId();
+		if (a <= 0) return null;
+		if (GameDataManager.WEAPON_ARCHETYPES == null) return null;
+		return GameDataManager.WEAPON_ARCHETYPES.get(a);
+	}
+
+	private static void mergeProjectileEffects(Bullet b, Projectile proj, ShotContext ctx) {
+		// Merge base projectile effects with any gemstone on-hit statuses.
 		final List<ProjectileEffect> merged = new ArrayList<>();
 		if (proj != null && proj.getEffects() != null) merged.addAll(proj.getEffects());
-		if (cm != null) {
-			for (CombatModifiers.OnHitEffect oh : cm.getOnHitEffects()) {
+		if (ctx != null) {
+			for (ShotContext.OnHitStatus oh : ctx.getOnHitStatuses()) {
 				final ProjectileEffect pe = new ProjectileEffect();
-				pe.setEffectId((short) oh.getEffectId());
+				pe.setEffectId(oh.getEffectId());
 				pe.setDuration(oh.getDurationMs());
 				merged.add(pe);
 			}
@@ -1089,7 +1159,7 @@ public class ServerGameLogic {
 
 				// Defer realm join to the tick thread so addPlayer + invalidateRealmLoadState
 				// run atomically with the LoadPacket delta logic (no race condition).
-				mgr.enqueuePendingJoin(new RealmManagerServer.PendingRealmJoin(
+				mgr.enqueuePendingJoin(new PendingRealmJoin(
 						targetRealm, player, command.getSrcIp(), userSession, commandResponse));
 				log.info("[SERVER] Player {} login queued for tick-thread processing", player);
 			} catch (Exception e) {

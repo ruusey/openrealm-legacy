@@ -277,16 +277,16 @@ public class ServerPotionStorageHelper {
         net.setForgeStatId(item.getForgeStatId());
         net.setForgeSlotId(item.getForgeSlotId());
         net.setRarity(item.getRarity());
-        net.setGemEffectType(item.getGemEffectType());
-        net.setGemParam1(item.getGemParam1());
-        net.setGemMagnitude(item.getGemMagnitude());
-        net.setGemDurationMs(item.getGemDurationMs());
+        net.setGemstoneType(item.getGemstoneType());
+        net.setGemPixelX(item.getGemPixelX());
+        net.setGemPixelY(item.getGemPixelY());
+        net.setGemPixelColor(item.getGemPixelColor());
         final List<NetEnchantment> ench;
         if (item.getEnchantments() != null && !item.getEnchantments().isEmpty()) {
             ench = new ArrayList<>(item.getEnchantments().size());
             for (Enchantment e : item.getEnchantments()) {
                 ench.add(new NetEnchantment(e.getStatId(), e.getDeltaValue(), e.getPixelX(), e.getPixelY(),
-                        e.getPixelColor(), e.getEffectType(), e.getParam1(), e.getMagnitude(), e.getDurationMs()));
+                        e.getPixelColor()));
             }
         } else {
             ench = new ArrayList<>();

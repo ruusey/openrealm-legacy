@@ -66,7 +66,9 @@ import com.openrealm.game.entity.Entity;
 import com.openrealm.game.entity.GameObject;
 import com.openrealm.game.entity.Player;
 import com.openrealm.game.entity.Portal;
-import com.openrealm.game.entity.item.CombatModifiers;
+import com.openrealm.game.entity.item.gem.Gemstone;
+import com.openrealm.game.entity.item.gem.GemstoneRegistry;
+import com.openrealm.game.entity.item.gem.ShotContext;
 import com.openrealm.game.entity.item.Effect;
 import com.openrealm.game.entity.item.GameItem;
 import com.openrealm.game.entity.item.LootContainer;
@@ -202,66 +204,42 @@ public class RealmManagerServer implements Runnable {
 	// At 10 a maxed (75 DEX) striker pens 7 DEF.
 	private static final int PRECISION_STRIKER_DEX_DIVISOR = 10;
 
-	// Phase 4 — Necromancer Soul Harvest (#4 ult). Each cast spawns a vortex
-	// field that lives for {@code expiresAt - now} ms; the tick loop drains
-	// HP from enemies inside the field every {@code DRAIN_PERIOD_MS} and
-	// heals allies in the same radius for the total HP sapped that tick.
-	// One field per realm per caster — recasting replaces the previous.
-	private static final class SoulHarvestField {
-		final long realmId;
-		final long casterId;
-		final float x, y;
-		final float radius;
-		final long expiresAtMs;
-		long lastTickMs;
-		SoulHarvestField(long realmId, long casterId, float x, float y, float radius, long expiresAtMs) {
-			this.realmId = realmId; this.casterId = casterId;
-			this.x = x; this.y = y; this.radius = radius;
-			this.expiresAtMs = expiresAtMs;
-			this.lastTickMs = 0L;
-		}
-	}
-	private final List<SoulHarvestField> soulHarvestFields = new ArrayList<>();
-
-	// Ninja Blade Storm — visual-only orbiting shurikens around a player for
-	// the buff duration. The DAMAGING status is what actually buffs damage;
-	// this struct just keeps the renderer refreshed with the player's current
-	// position so the blades follow them around as they move.
-	private static final class BladeOrbitState {
-		final long realmId;
-		final long casterId;
-		final long expiresAtMs;
-		final byte tier;
-		BladeOrbitState(long realmId, long casterId, long expiresAtMs, byte tier) {
-			this.realmId = realmId; this.casterId = casterId;
-			this.expiresAtMs = expiresAtMs; this.tier = tier;
-		}
-	}
-	private final List<BladeOrbitState> bladeOrbitStates = new ArrayList<>();
-
-	// Ninja Death Blossom — 5-second armor-piercing spiral at a cursor point.
-	// Damage is split across 5 one-second ticks rather than instant. Visual
-	// refreshes each tick so the spiral keeps spinning over the full duration.
-	private static final class BladeBlenderField {
-		final long realmId;
-		final long casterId;
-		final float x, y;
-		final float radius;
-		final long expiresAtMs;
-		final int  damagePerTick;
-		final byte tier;
-		long lastTickMs;
-		BladeBlenderField(long realmId, long casterId, float x, float y, float radius,
-				long expiresAtMs, int damagePerTick, byte tier) {
-			this.realmId = realmId; this.casterId = casterId;
-			this.x = x; this.y = y; this.radius = radius;
-			this.expiresAtMs = expiresAtMs;
-			this.damagePerTick = damagePerTick;
-			this.tier = tier;
-			this.lastTickMs = 0L;
-		}
-	}
-	private final List<BladeBlenderField> bladeBlenderFields = new ArrayList<>();
+	// TODO(persistent-effects): the deprecated 2026-05-18 class rewrite stripped
+	// out three bespoke persistent-effect primitives that used to live here —
+	// `SoulHarvestField` (Necromancer ult: vortex that drained HP and healed
+	// allies over time), `BladeOrbitState` (Ninja Blade Storm: visual-only
+	// orbiting shurikens that followed the caster), and `BladeBlenderField`
+	// (Ninja Death Blossom: 5s spiraling armor-piercing DoT at a cursor point).
+	// Each was a per-cast struct held in a List<> on RealmManagerServer with a
+	// dedicated tick loop in update().
+	//
+	// The new class roster doesn't use any of them today, but the design space
+	// they covered — "ability spawns a ground-anchored or caster-anchored
+	// region that periodically applies damage/heal/status and emits visuals
+	// until it expires" — is the same shape we'll need for Ninja Caltrops
+	// (lingering ground hazard, see 13031) and any future kits with stick-
+	// around effects. When we build that, do it as ONE generic primitive:
+	//
+	//   class PersistentEffect {
+	//       long realmId, casterId, expiresAtMs, lastTickMs;
+	//       Vector2f anchor;              // fixed point on ground, OR
+	//       Long followEntityId;          // entity to track (for orbit-style)
+	//       float radius;
+	//       short visualEffectId;         // CreateEffectPacket.EFFECT_*
+	//       short visualDurationMs;
+	//       byte  visualTier;
+	//       int   visualRefreshTicks;     // re-emit the visual every N ticks
+	//       int   tickPeriodMs;           // gameplay tick cadence
+	//       PersistentEffectPayload payload;  // damage/heal/status/etc.
+	//   }
+	//
+	// Drive the cadence and visual refresh from the tick loop the way the old
+	// systems did, but with a single list<PersistentEffect> instead of three.
+	// JSON authoring lives on Ability as a new AbilityEffect type
+	// "SPAWN_PERSISTENT_FIELD" with the parameters above.
+	//
+	// Caltrops (13031) is the first user — currently uses SKILL_POINTS scaling
+	// on the SLOWED debuff duration as a stand-in for the lingering hazard.
 	// Per-realm last-tick wall-clock used to compute bulletScale ONCE per
 	// realm per tick instead of per-bullet — eliminates ~12K nanoTime
 	// syscalls/sec when 200 bullets are in flight.
@@ -368,7 +346,7 @@ public class RealmManagerServer implements Runnable {
 	// the cap, attacks distribute across enemies fairly via the natural
 	// arrival ordering. PLAYER bullets always succeed regardless of cap so
 	// player attack feel is preserved.
-	private static final int MAX_ENEMY_BULLETS_PER_REALM = 1500;
+	private static final int MAX_ENEMY_BULLETS_PER_REALM = 10000;
 
 	private boolean  isSetup = false;
 	
@@ -597,8 +575,19 @@ public class RealmManagerServer implements Runnable {
 		final long tickTotal = System.nanoTime() - tickStart;
 		this.currentTickCount++;
 		this.tickTimeAccumNanos += tickTotal;
-		if (Instant.now().toEpochMilli() - this.tickSampleTime > 1000) {
-			this.tickSampleTime = Instant.now().toEpochMilli();
+		// Per-second log. Advance the sample window by EXACTLY 1000ms each
+		// cycle (was `= Instant.now()`, which slipped 1–2ms every cycle and
+		// occasionally caught a 65th tick inside a 1001–1002ms window —
+		// hence the "65 ticks this second" log noise). Single now() capture
+		// to avoid the second-syscall drift the previous code also had.
+		final long nowMs = Instant.now().toEpochMilli();
+		if (nowMs - this.tickSampleTime >= 1000) {
+			this.tickSampleTime += 1000;
+			// Hard catch-up: if the loop stalled long enough that we're past
+			// the next boundary, snap forward instead of spamming logs.
+			if (nowMs - this.tickSampleTime >= 1000) {
+				this.tickSampleTime = nowMs;
+			}
 			final double avgMs = this.currentTickCount > 0
 				? (this.tickTimeAccumNanos / (double) this.currentTickCount) / 1_000_000.0
 				: 0.0;
@@ -608,9 +597,9 @@ public class RealmManagerServer implements Runnable {
 			this.tickTimeAccumNanos = 0L;
 		}
 		if (tickTotal > TICK_BUDGET_NANOS) {
-			final long nowMs = System.currentTimeMillis();
-			if (nowMs - lastSlowTickLogMs >= 1000) {
-				lastSlowTickLogMs = nowMs;
+			final long slowLogNowMs = System.currentTimeMillis();
+			if (slowLogNowMs - lastSlowTickLogMs >= 1000) {
+				lastSlowTickLogMs = slowLogNowMs;
 				int totalEnemies = 0, totalBullets = 0, totalPlayers = 0;
 				for (Realm r : this.realms.values()) {
 					totalEnemies += r.getEnemies().size();
@@ -965,7 +954,7 @@ public class RealmManagerServer implements Runnable {
 								this.playerLoadLedger.put(player.getKey(), ledger);
 								this.playerLastFullSnapshotMs.put(player.getKey(), nowMs);
 							}
-							final Realm.VisibleIds desired = realm.getVisibleIdsCircularFast(
+							final VisibleIds desired = realm.getVisibleIdsCircularFast(
 									playerCenter, viewportRadius, player.getKey());
 
 							final Long lastFull = this.playerLastFullSnapshotMs.get(player.getKey());
@@ -973,22 +962,22 @@ public class RealmManagerServer implements Runnable {
 									|| (nowMs - lastFull) >= FULL_SNAPSHOT_INTERVAL_MS;
 
 							// Delta sets — start with strict set diff.
-							final Set<Long> playersToLoad    = setDiff(desired.players,    ledger.players);
-							final Set<Long> enemiesToLoad    = setDiff(desired.enemies,    ledger.enemies);
-							final Set<Long> bulletsToLoad    = setDiff(desired.bullets,    ledger.bullets);
-							final Set<Long> containersToLoad = setDiff(desired.containers, ledger.containers);
-							final Set<Long> portalsToLoad    = setDiff(desired.portals,    ledger.portals);
+							final Set<Long> playersToLoad    = setDiff(desired.getPlayers(),    ledger.players);
+							final Set<Long> enemiesToLoad    = setDiff(desired.getEnemies(),    ledger.enemies);
+							final Set<Long> bulletsToLoad    = setDiff(desired.getBullets(),    ledger.bullets);
+							final Set<Long> containersToLoad = setDiff(desired.getContainers(), ledger.containers);
+							final Set<Long> portalsToLoad    = setDiff(desired.getPortals(),    ledger.portals);
 
-							final Set<Long> playersToUnload    = setDiff(ledger.players,    desired.players);
-							final Set<Long> enemiesToUnload    = setDiff(ledger.enemies,    desired.enemies);
-							final Set<Long> bulletsToUnload    = setDiff(ledger.bullets,    desired.bullets);
-							final Set<Long> containersToUnload = setDiff(ledger.containers, desired.containers);
-							final Set<Long> portalsToUnload    = setDiff(ledger.portals,    desired.portals);
+							final Set<Long> playersToUnload    = setDiff(ledger.players,    desired.getPlayers());
+							final Set<Long> enemiesToUnload    = setDiff(ledger.enemies,    desired.getEnemies());
+							final Set<Long> bulletsToUnload    = setDiff(ledger.bullets,    desired.getBullets());
+							final Set<Long> containersToUnload = setDiff(ledger.containers, desired.getContainers());
+							final Set<Long> portalsToUnload    = setDiff(ledger.portals,    desired.getPortals());
 
 							// Re-send loot containers whose contents mutated this tick
 							// (pickups/inserts). Client merges the new payload into the
 							// existing entry — no unload+reload round-trip needed.
-							for (final Long id : desired.containers) {
+							for (final Long id : desired.getContainers()) {
 								if (containersToLoad.contains(id)) continue;
 								final LootContainer lc = realm.getLoot().get(id);
 								if (lc != null && lc.getContentsChanged()) containersToLoad.add(id);
@@ -999,11 +988,11 @@ public class RealmManagerServer implements Runnable {
 								// and emit a full snapshot of the desired set, plus
 								// unloads for everything in the ledger no longer desired.
 								// Survives any dropped delta within FULL_SNAPSHOT_INTERVAL_MS.
-								playersToLoad.clear();    playersToLoad.addAll(desired.players);
-								enemiesToLoad.clear();    enemiesToLoad.addAll(desired.enemies);
-								bulletsToLoad.clear();    bulletsToLoad.addAll(desired.bullets);
-								containersToLoad.clear(); containersToLoad.addAll(desired.containers);
-								portalsToLoad.clear();    portalsToLoad.addAll(desired.portals);
+								playersToLoad.clear();    playersToLoad.addAll(desired.getPlayers());
+								enemiesToLoad.clear();    enemiesToLoad.addAll(desired.getEnemies());
+								bulletsToLoad.clear();    bulletsToLoad.addAll(desired.getBullets());
+								containersToLoad.clear(); containersToLoad.addAll(desired.getContainers());
+								portalsToLoad.clear();    portalsToLoad.addAll(desired.getPortals());
 								this.playerLastFullSnapshotMs.put(player.getKey(), nowMs);
 							}
 
@@ -1830,6 +1819,24 @@ public class RealmManagerServer implements Runnable {
 		// For each world on the server
 		for (final Map.Entry<Long, Realm> realmEntry : this.realms.entrySet()) {
 			final Realm realm = realmEntry.getValue();
+			// Idle realm short-circuit: a generated realm with no players has
+			// no one to AI-target, no one to hit with bullets, no LoadPackets
+			// to build. Skip the whole player/enemy/bullet update pass. We
+			// still let the cross-realm tail (removeExpiredBullets et al)
+			// sweep stragglers globally below. The one piece of bookkeeping
+			// we owe is zeroing any mid-move enemy's velocity so the world
+			// doesn't drift while no player observes it.
+			if (realm.getPlayers().isEmpty()) {
+				if (!realm.getEnemies().isEmpty()) {
+					for (final Enemy enemy : realm.getEnemies().values()) {
+						if (enemy.getDx() != 0f || enemy.getDy() != 0f) {
+							enemy.setDx(0);
+							enemy.setDy(0);
+						}
+					}
+				}
+				continue;
+			}
 			// Update player specific game objects — run inline, these are fast per-player ops
 			final long pStart = System.nanoTime();
 			for (final Map.Entry<Long, Player> player : realm.getPlayers().entrySet()) {
@@ -1886,15 +1893,33 @@ public class RealmManagerServer implements Runnable {
 			final int moveFarTick = (int) (this.tickCounter & (ENEMY_MOVE_FAR_DIVISOR - 1));
 			final Player[] activePlayers = realm.getPlayers().values().toArray(new Player[0]);
 			final int playerCount = activePlayers.length;
-			for (final Enemy enemy : realm.getEnemies().values()) {
+			// Spatial-grid pre-filter: only enemies within MAX_AWAKE_RADIUS of
+			// at least one player can possibly be awake (max enemy chaseRange
+			// in the catalog is 700; the radius is a bit wider for safety
+			// margin). Anything farther is guaranteed dormant — we don't
+			// iterate them at all this tick. Cost: O(players × grid query)
+			// to build the candidate set, vs the old O(enemies × players)
+			// distance sweep over every enemy in the realm. For a realm with
+			// 1000 generated enemies and one player only ~50 are typically
+			// within range, dropping enemy-tick cost by ~20×.
+			final float MAX_AWAKE_RADIUS = 720f;
+			final java.util.Set<Long> candidates = new java.util.HashSet<>();
+			for (int i = 0; i < playerCount; i++) {
+				final Player p = activePlayers[i];
+				candidates.addAll(realm.queryEnemiesNear(p.getPos().x, p.getPos().y, MAX_AWAKE_RADIUS));
+			}
+			for (final long cid : candidates) {
+				final Enemy enemy = realm.getEnemies().get(cid);
+				if (enemy == null) continue;
 				// Single distance pass classifies the enemy:
 				//   visible — within viewport of ANY player -> full 64Hz move
 				//   awake   — within chaseRange of ANY player but not visible ->
 				//             AI staggered + movement only every Nth tick
-				//   dormant — outside chaseRange of every player -> no work
+				//   dormant — outside chaseRange of every player -> only dx/dy
+				//             zeroed; AI / move / script all skipped
 				boolean awake = false;
 				boolean visible = false;
-				if (playerCount > 0) {
+				{
 					final float ex = enemy.getPos().x;
 					final float ey = enemy.getPos().y;
 					final float chaseRangeSq = (float) enemy.getChaseRange() * enemy.getChaseRange();
@@ -1918,7 +1943,12 @@ public class RealmManagerServer implements Runnable {
 						enemy.setDx(0);
 						enemy.setDy(0);
 					}
-					enemy.removeExpiredEffects();
+					// removeExpiredEffects moved OUT of the dormant path.
+					// Status effects on out-of-range enemies are inert (no
+					// one's there to see them tick down, no DoT damage is
+					// being applied), so we skip the per-tick Instant.now()
+					// sweep. They'll be cleaned the first tick the enemy
+					// re-enters someone's chaseRange.
 					continue;
 				}
 				if ((enemy.getId() & (ENEMY_AI_TICK_DIVISOR - 1)) == aiTick) {
@@ -2053,145 +2083,12 @@ public class RealmManagerServer implements Runnable {
 			}
 		}
 
-		// Necromancer Soul Harvest — vortex field tick. Every tick we evict
-		// expired fields and refresh the visual; every ~1s we drain HP from
-		// enemies inside and heal allies in radius for the total sapped.
-		if (!this.soulHarvestFields.isEmpty()) {
-			final long now = Instant.now().toEpochMilli();
-			final long DRAIN_PERIOD_MS = 1000L;
-			final int  DRAIN_PER_TICK  = 50;
-			final Iterator<SoulHarvestField> it = this.soulHarvestFields.iterator();
-			while (it.hasNext()) {
-				final SoulHarvestField f = it.next();
-				if (now >= f.expiresAtMs) { it.remove(); continue; }
-				final Realm realm = this.realms.get(f.realmId);
-				if (realm == null) { it.remove(); continue; }
-				// Refresh persistent visual every 12 ticks (~190ms). Tier 6 =
-				// purple/violet tint for the necro soul-drain look.
-				if (this.tickCounter % 12 == 0) {
-					this.enqueueServerPacketToRealm(realm, CreateEffectPacket.aoeEffect(
-							CreateEffectPacket.EFFECT_SOUL_VORTEX, f.x, f.y, f.radius, (short) 240, (byte) 6));
-				}
-				// 1Hz drain + heal pulse.
-				if (now - f.lastTickMs < DRAIN_PERIOD_MS) continue;
-				f.lastTickMs = now;
-				final float rSq = f.radius * f.radius;
-				int totalSapped = 0;
-				final List<Enemy> dead = new ArrayList<>();
-				for (final Enemy enemy : realm.getEnemies().values()) {
-					if (enemy.getDeath()) continue;
-					if (enemy.hasEffect(StatusEffectType.STASIS)
-							|| enemy.hasEffect(StatusEffectType.INVINCIBLE)) continue;
-					final float dx = enemy.getPos().x - f.x;
-					final float dy = enemy.getPos().y - f.y;
-					if (dx * dx + dy * dy > rSq) continue;
-					// Armor-piercing — sapped damage ignores defense.
-					final short dmg = (short) Math.min(Short.MAX_VALUE, DRAIN_PER_TICK);
-					enemy.setHealth(enemy.getHealth() - dmg);
-					this.broadcastTextEffect(realm, EntityType.ENEMY, enemy,
-							TextEffect.ARMOR_BREAK, "-" + dmg);
-					totalSapped += dmg;
-					if (enemy.getHealth() <= 0) dead.add(enemy);
-				}
-				for (final Enemy e : dead) this.enemyDeath(realm, e);
-				if (totalSapped > 0) {
-					// Heal every ally in the AURA RING — outside the vortex
-					// itself, within ~2× the vortex radius. Standing inside
-					// the meat grinder is for the enemies; allies sit on the
-					// edge soaking the souls being thrown outward.
-					final float healOuterR  = f.radius * 2.5f;
-					final float healOuterSq = healOuterR * healOuterR;
-					for (final Player ally : realm.getPlayers().values()) {
-						if (ally == null) continue;
-						final Vector2f ac = ally.getPos().clone(ally.getSize() / 2, ally.getSize() / 2);
-						final float adx = ac.x - f.x, ady = ac.y - f.y;
-						final float distSq = adx * adx + ady * ady;
-						if (distSq < rSq) continue;                  // inside vortex — no heal
-						if (distSq > healOuterSq) continue;          // too far away
-						final int maxHp = ally.getComputedStats() != null ? ally.getComputedStats().getHp() : ally.getHealth();
-						final int newHp = Math.min(maxHp, ally.getHealth() + totalSapped);
-						final int actual = newHp - ally.getHealth();
-						if (actual > 0) {
-							ally.setHealth(newHp);
-							this.broadcastTextEffect(realm, EntityType.PLAYER, ally,
-									TextEffect.HEAL, "+" + actual);
-							// Soul streamer — chain-lightning-style trail from
-							// the vortex center to the ally being healed. Read
-							// as "soul essence absorbed". EFFECT_LIFE_DRAIN is
-							// already a red/violet drain visual (renderer case
-							// 23), which fits the soul-harvest palette.
-							this.enqueueServerPacketToRealm(realm, CreateEffectPacket.lineEffect(
-									CreateEffectPacket.EFFECT_LIFE_DRAIN,
-									f.x, f.y, ac.x, ac.y, (short) 500, (byte) 6));
-						}
-					}
-				}
-			}
-		}
-
-		// Ninja Blade Storm — visual-only orbiting shurikens. Re-broadcast
-		// every 16 ticks (~250ms) at the caster's CURRENT position with a
-		// per-packet duration of 600ms so consecutive packets generously
-		// overlap and the orbit reads as continuous as the player moves.
-		// The renderer dedupes by effect type (only the newest BLADE_ORBIT
-		// actually paints), so stacking packets doesn't cause flicker.
-		if (!this.bladeOrbitStates.isEmpty() && this.tickCounter % 16 == 0) {
-			final long now = Instant.now().toEpochMilli();
-			final Iterator<BladeOrbitState> it = this.bladeOrbitStates.iterator();
-			while (it.hasNext()) {
-				final BladeOrbitState s = it.next();
-				if (now >= s.expiresAtMs) { it.remove(); continue; }
-				final Realm realm = this.realms.get(s.realmId);
-				if (realm == null) { it.remove(); continue; }
-				final Player caster = realm.getPlayer(s.casterId);
-				if (caster == null) { it.remove(); continue; }
-				final Vector2f pc = caster.getPos().clone(caster.getSize() / 2, caster.getSize() / 2);
-				this.enqueueServerPacketToRealm(realm, CreateEffectPacket.aoeEffect(
-						CreateEffectPacket.EFFECT_BLADE_ORBIT, pc.x, pc.y, 56f, (short) 600, s.tier));
-			}
-		}
-
-		// Ninja Death Blossom — spiraling blade-blender DoT. Re-emit the
-		// visual every 6 ticks and drain HP from enemies inside every 1s.
-		// Damage is armor-piercing (the ult tag is armor_pierce). Total
-		// damage is spread across 5 one-second ticks.
-		if (!this.bladeBlenderFields.isEmpty()) {
-			final long now = Instant.now().toEpochMilli();
-			final long DRAIN_PERIOD_MS = 1000L;
-			final Iterator<BladeBlenderField> it = this.bladeBlenderFields.iterator();
-			while (it.hasNext()) {
-				final BladeBlenderField f = it.next();
-				if (now >= f.expiresAtMs) { it.remove(); continue; }
-				final Realm realm = this.realms.get(f.realmId);
-				if (realm == null) { it.remove(); continue; }
-				// Re-emit the spiral visual every 16 ticks (~250ms) with a
-				// generous 600ms per-packet duration. Same dedupe-by-type
-				// approach as blade_orbit keeps the spiral readable instead
-				// of stacking blade groups out of phase with each other.
-				if (this.tickCounter % 16 == 0) {
-					this.enqueueServerPacketToRealm(realm, CreateEffectPacket.aoeEffect(
-							CreateEffectPacket.EFFECT_BLADE_BLENDER, f.x, f.y, f.radius, (short) 600, f.tier));
-				}
-				if (now - f.lastTickMs < DRAIN_PERIOD_MS) continue;
-				f.lastTickMs = now;
-				final float rSq = f.radius * f.radius;
-				final List<Enemy> dead = new ArrayList<>();
-				for (final Enemy enemy : realm.getEnemies().values()) {
-					if (enemy.getDeath()) continue;
-					if (enemy.hasEffect(StatusEffectType.STASIS)
-							|| enemy.hasEffect(StatusEffectType.INVINCIBLE)) continue;
-					final float dx = enemy.getPos().x - f.x;
-					final float dy = enemy.getPos().y - f.y;
-					if (dx * dx + dy * dy > rSq) continue;
-					final short dmg = (short) Math.min(Short.MAX_VALUE, f.damagePerTick);
-					enemy.setHealth(enemy.getHealth() - dmg);
-					this.broadcastTextEffect(realm, EntityType.ENEMY, enemy,
-							TextEffect.ARMOR_BREAK, "-" + dmg);
-					if (enemy.getHealth() <= 0) dead.add(enemy);
-				}
-				for (final Enemy e : dead) this.enemyDeath(realm, e);
-			}
-		}
+		// (Persistent-effect tick loops removed 2026-05-19 — see TODO at top of
+		// this file. The Necromancer Soul Harvest vortex, Ninja Blade Storm
+		// orbit, and Ninja Death Blossom spiral all lived here; their abilities
+		// no longer exist in the 2026-05-18 class rewrite. Bring them back as
+		// one shared persistent-effect primitive when Caltrops or similar
+		// needs to linger on the ground / follow the caster.)
 
 		// Phase 4 — Party MVP. Refresh every 32 ticks (~0.5s) so teammate
 		// HP/MP bars track combat in near-real-time. Also drop expired
@@ -2580,6 +2477,13 @@ public class RealmManagerServer implements Runnable {
 			final int mpCost = abMpCost >= 0 ? abMpCost : effect.getMpCost();
 			if (player.getMana() < mpCost) return;
 			player.setMana(player.getMana() - mpCost);
+			// Force the next PlayerStatePacket to ship even if a healer regen
+			// happens to restore mana back to the cached value before the next
+			// 8Hz mark. Without this the client's predicted-deduction view
+			// stays low because equalsState() sees the post-regen mana ==
+			// cached mana and skips the send — and the client then gates
+			// further casts on its stale-low local value.
+			this.playerStateState.remove(player.getId());
 		}
 
 		// ── Cast-time gate ──────────────────────────────────────────
@@ -2676,13 +2580,15 @@ public class RealmManagerServer implements Runnable {
 				? GameDataManager.PROJECTILE_GROUPS.get(effPgId)
 				: null;
 
-		// Phase 1B: ability is class-bound, not equipped. CombatModifiers
-		// for the ability are now derived from the GameItem template (no
-		// per-instance enchantments since the ability isn't a held item).
-		// Null-guard for classes that have no legacy ability item (Heavy_*).
-		final CombatModifiers abilityCm = abilityItem != null
-				? CombatModifiers.fromItem(abilityItem)
-				: new CombatModifiers();
+		// Phase 1B: ability is class-bound, not equipped. Abilities have no
+		// gemstone socket today, so the ShotContext is created empty — if a
+		// future kit lets a Gemstone modify ability projectiles, populate
+		// here. Null-guard for classes with no legacy ability item (Heavy_*).
+		final ShotContext abilityCtx = new ShotContext();
+		if (abilityItem != null) {
+			final Gemstone g = GemstoneRegistry.forItem(abilityItem);
+			if (g != null) g.modifyShot(abilityCtx, player, abilityItem);
+		}
 
 		// Phase 2B: ability tag "from_sky" emits a two-part visual at the
 		// cursor — a vertical chain-lightning streak descending from 320 px
@@ -2762,23 +2668,7 @@ public class RealmManagerServer implements Runnable {
 				}
 			}
 
-			// "soul_harvest" — Necromancer #4 ult. Spawns a 10s vortex field at
-			// the targeted spot that drains 50 HP/s from enemies inside and
-			// heals allies in radius for the total HP sapped each tick. The
-			// initial aoe_targeted armor-piercing burst still resolves above
-			// — this tag only stands up the persistent field + visual.
-			if (ab.getTags().contains("soul_harvest")) {
-				final long ttlMs = 10_000L;
-				final float vortexR = 128f;
-				// Replace any existing field this caster had (recast).
-				soulHarvestFields.removeIf(f -> f.casterId == player.getId());
-				soulHarvestFields.add(new SoulHarvestField(
-						targetRealm.getRealmId(), player.getId(),
-						pos.x, pos.y, vortexR, now + ttlMs));
-				// Immediate visual — the tick loop will refresh it.
-				this.enqueueServerPacketToRealm(targetRealm, CreateEffectPacket.aoeEffect(
-						CreateEffectPacket.EFFECT_SOUL_VORTEX, pos.x, pos.y, vortexR, (short) 1200, (byte) 6));
-			}
+			// soul_harvest spawn removed 2026-05-19 — see TODO at top of file.
 
 			// "taunt_visual" — small red circle blink at player + "TAUNTING" text.
 			if (ab.getTags().contains("taunt_visual")) {
@@ -2901,55 +2791,7 @@ public class RealmManagerServer implements Runnable {
 				}
 			}
 
-			// "blade_orbit" tag — Ninja #3 Blade Storm. Visual-only orbiting
-			// shurikens around the player for the DAMAGING buff duration. The
-			// tick loop in update() re-emits the effect every 6 ticks centered
-			// on the caster's live position so the orbit follows movement.
-			if (ab.getTags().contains("blade_orbit")) {
-				final int sp = player.getSkillLevel(ab.getId());
-				// Tier byte = SP, 0..5. The client looks up col = 10 + tier
-				// in openrealm-items.png to draw the matching shuriken sprite
-				// (Iron → Demonbane). Max SP is 5 so this is safe.
-				final byte tier = (byte) Math.min(5, Math.max(0, sp));
-				bladeOrbitStates.removeIf(s -> s.casterId == player.getId());
-				bladeOrbitStates.add(new BladeOrbitState(
-						targetRealm.getRealmId(), player.getId(), now + 5000L, tier));
-				// Immediate visual — the tick loop will refresh.
-				final Vector2f pc = player.getPos().clone(player.getSize() / 2, player.getSize() / 2);
-				this.enqueueServerPacketToRealm(targetRealm, CreateEffectPacket.aoeEffect(
-						CreateEffectPacket.EFFECT_BLADE_ORBIT, pc.x, pc.y, 56f, (short) 600, tier));
-			}
-
-			// "blade_blender" tag — Ninja #4 Death Blossom. Spawns a 5s spiral
-			// at the cursor that shreds enemies inside every 1s. Total damage
-			// budget = ab base + DEX/SP scaling, split across 5 ticks. Tier
-			// (Crimson/Obsidian/Demonbane = items 301/302/303) escalates with
-			// SP — max SP is 3 so the tier band is 2..4 of the shuriken set.
-			if (ab.getTags().contains("blade_blender")) {
-				final int sp = player.getSkillLevel(ab.getId());
-				// Death Blossom max SP is 3. Start at Crimson (col 13 = tier 3
-				// in the col-10-based palette) and climb to Demonbane at SP 2-3.
-				// SP 0 -> tier 3 (Crimson), SP 1 -> tier 4 (Obsidian),
-				// SP 2-3 -> tier 5 (Demonbane). Tier byte feeds renderer's
-				// col-offset lookup against openrealm-items.png row 16.
-				final byte tier = (byte) Math.min(5, 3 + Math.max(0, sp));
-				int total = ab.getBaseDamage();
-				for (AbilityScaling sc : ab.scalingList()) {
-					if (!"DAMAGE".equalsIgnoreCase(sc.getTarget())) continue;
-					final int sv = resolveScalingInput(player, ab, sc);
-					total += (int) sc.curveEnum().apply(sv, sc.getCoeff(), sc.getCap());
-				}
-				final int perTick = Math.max(1, total / 5);
-				final long ttlMs = 5000L;
-				final float radius = 144f;
-				bladeBlenderFields.removeIf(f -> f.casterId == player.getId());
-				bladeBlenderFields.add(new BladeBlenderField(
-						targetRealm.getRealmId(), player.getId(),
-						pos.x, pos.y, radius, now + ttlMs, perTick, tier));
-				// Immediate visual — the tick loop will refresh it.
-				this.enqueueServerPacketToRealm(targetRealm, CreateEffectPacket.aoeEffect(
-						CreateEffectPacket.EFFECT_BLADE_BLENDER, pos.x, pos.y, radius, (short) 600, tier));
-			}
+			// blade_orbit + blade_blender spawns removed 2026-05-19 — see TODO at top of file.
 		}
 
 		// Phase 2B: ability tag "aoe_targeted" handles ground-targeted AoE
@@ -2994,7 +2836,6 @@ public class RealmManagerServer implements Runnable {
 				if (ab.getTags().contains("bless"))    { visualEffect = CreateEffectPacket.EFFECT_PALADIN_SEAL;   vTier = 3; } // gold
 				if (ab.getTags().contains("holy"))     { visualEffect = CreateEffectPacket.EFFECT_PALADIN_SEAL;   vTier = 3; } // gold
 				if (ab.getTags().contains("frost"))    { visualEffect = CreateEffectPacket.EFFECT_FROST_NOVA;     vTier = 1; } // ice
-				if (ab.getTags().contains("mark"))     { visualEffect = CreateEffectPacket.EFFECT_HUNTERS_RETICLE;vTier = 5; } // red reticle
 				if (ab.getTags().contains("poison"))   { visualEffect = CreateEffectPacket.EFFECT_POISON_CLOUD;   vTier = 2; } // toxic green
 				if (ab.getTags().contains("drain"))    { visualEffect = CreateEffectPacket.EFFECT_LIFE_DRAIN;     vTier = 5; } // blood red
 				if (ab.getTags().contains("bone"))     { visualEffect = CreateEffectPacket.EFFECT_BONE_SPIKES;    vTier = 0; } // bone white
@@ -3011,12 +2852,8 @@ public class RealmManagerServer implements Runnable {
 				if (ab.getTags().contains("warcry"))   { visualEffect = CreateEffectPacket.EFFECT_WAR_CRY_WAVE;   vTier = 5; } // red roar
 				if (ab.getTags().contains("caltrops")) { visualEffect = CreateEffectPacket.EFFECT_CALTROPS;       vTier = 0; } // steel spikes
 				if (ab.getTags().contains("smoke"))    { visualEffect = CreateEffectPacket.EFFECT_SMOKE_POOF;     vTier = 0; } // grey smoke
-				// Bespoke phase-3 visuals — these supersede the generic ring
-				// renderer with hand-tuned procedural effects in renderer.js +
-				// PlayState.java. Tier byte is mostly cosmetic for them.
-				if (ab.getTags().contains("reality_tear"))   { visualEffect = CreateEffectPacket.EFFECT_REALITY_TEAR;    vTier = 6; } // void rift
-				if (ab.getTags().contains("phantom_strike")) { visualEffect = CreateEffectPacket.EFFECT_PHANTOM_STRIKE;  vTier = 6; } // shadow afterimage
-				if (ab.getTags().contains("stasis_lock"))    { visualEffect = CreateEffectPacket.EFFECT_STASIS_LOCK;     vTier = 2; } // frozen clock
+				// Bespoke phase-3 visuals — hand-tuned procedural effects in
+				// renderer.js + PlayState.java. Tier byte is mostly cosmetic.
 				if (ab.getTags().contains("sanctuary"))      { visualEffect = CreateEffectPacket.EFFECT_SANCTUARY_DOME;  vTier = 3; } // golden dome
 				if (ab.getTags().contains("vampiric"))       { visualEffect = CreateEffectPacket.EFFECT_VAMPIRIC_LATCH;  vTier = 5; } // red drain
 				// Heavy class visuals (2026-05-14)
@@ -3026,15 +2863,20 @@ public class RealmManagerServer implements Runnable {
 				if (ab.getTags().contains("divine_beam"))    { visualEffect = CreateEffectPacket.EFFECT_DIVINE_BEAM;     vTier = 3; } // gold pillar
 				if (ab.getTags().contains("fortify_aura"))   { visualEffect = CreateEffectPacket.EFFECT_FORTIFY_AURA;    vTier = 2; } // green regen
 				if (ab.getTags().contains("ground_pound"))   { visualEffect = CreateEffectPacket.EFFECT_GROUND_POUND;    vTier = 4; } // brown dust
+				// 2026-05-19 — extra tag mappings so each of the 12 new classes can
+				// pick a within-class unique cast visual without sharing icons.
+				if (ab.getTags().contains("beast"))          { visualEffect = CreateEffectPacket.EFFECT_BEAST_CLAWS;     vTier = 5; } // primal claws
+				if (ab.getTags().contains("arcane_aura"))    { visualEffect = CreateEffectPacket.EFFECT_ARCANE_AURA;     vTier = 6; } // purple arcane
+				if (ab.getTags().contains("haste"))          { visualEffect = CreateEffectPacket.EFFECT_HASTE_WIND;      vTier = 1; } // wind streak
+				if (ab.getTags().contains("rampage"))        { visualEffect = CreateEffectPacket.EFFECT_RAMPAGE_AURA;    vTier = 5; } // berserker red
+				if (ab.getTags().contains("storm"))          { visualEffect = CreateEffectPacket.EFFECT_STORM_AURA;      vTier = 3; } // storm clouds
+				if (ab.getTags().contains("death_pact"))     { visualEffect = CreateEffectPacket.EFFECT_DEATH_PACT_AURA; vTier = 6; } // dark crimson
 				// A few effects benefit from a longer-than-default on-screen
-				// life (Sanctuary's INVINCIBLE buff lasts 5s; Stasis Lock's
-				// GROUNDED window is 4s). Bumping the per-packet duration
-				// keeps the visual matched to the gameplay window.
+				// life (Sanctuary's INVINCIBLE buff lasts 5s). Bumping the
+				// per-packet duration keeps the visual matched to the gameplay
+				// window.
 				short visualDurationMs = 1500;
 				if (visualEffect == CreateEffectPacket.EFFECT_SANCTUARY_DOME) visualDurationMs = 5000;
-				else if (visualEffect == CreateEffectPacket.EFFECT_STASIS_LOCK) visualDurationMs = 4000;
-				else if (visualEffect == CreateEffectPacket.EFFECT_REALITY_TEAR) visualDurationMs = 2500;
-				else if (visualEffect == CreateEffectPacket.EFFECT_PHANTOM_STRIKE) visualDurationMs = 1800;
 				else if (visualEffect == CreateEffectPacket.EFFECT_VAMPIRIC_LATCH) visualDurationMs = 2000;
 				// Heavy class visuals — match life to the gameplay flavor
 				else if (visualEffect == CreateEffectPacket.EFFECT_RAPIER_STAB) visualDurationMs = 350;
@@ -3227,6 +3069,64 @@ public class RealmManagerServer implements Runnable {
 			}
 			return; // Skip the projectile spawn paths — this was a pure AoE.
 		}
+		// New-system pure-Ability projectile branch (2026-05-18) — no legacy
+		// GameItem backing. Fires when the ability has a PROJECTILE_GROUP
+		// effect and ab.getBaseDamage() > 0 (damage comes from Ability data).
+		// Spawns at the player's center, oriented toward cursor.
+		// Pure-Ability projectile branch — fires whenever an Ability declares a
+		// PROJECTILE_GROUP and no legacy item backs it. Damage comes from
+		// baseDamage + DAMAGE scalings (an ability with scalings only — e.g.
+		// Fire Breath at "scalings: [WIS coeff 1.2 -> DAMAGE]" and no flat
+		// baseDamage — was previously skipped because we gated on baseDamage>0,
+		// so the cast resolved as a no-op despite obviously firing).
+		if (abilityItem == null && ab != null && group != null) {
+			final Vector2f dest = new Vector2f(pos.x, pos.y);
+			final Vector2f source0 = player.getPos().clone(player.getSize() / 2, player.getSize() / 2);
+			final float angle = Bullet.getAngle(source0, dest);
+			int dmg = ab.getBaseDamage();
+			for (AbilityScaling sc : ab.scalingList()) {
+				if (!"DAMAGE".equalsIgnoreCase(sc.getTarget())) continue;
+				final int statVal = resolveScalingInput(player, ab, sc);
+				dmg += (int) sc.curveEnum().apply(statVal, sc.getCoeff(), sc.getCap());
+			}
+			final short rolledDamage = applyShotDamageMods(
+					(short) Math.min(Short.MAX_VALUE, Math.max(0, dmg)), abilityCtx);
+			for (final Projectile p : group.getProjectiles()) {
+				final short offset = (short) (p.getSize() / (short) 2);
+				final int totalBullets = 1 + abilityCtx.getExtraProjectiles();
+				final float SPREAD = 0.10f;
+				final float baseA = angle + Float.parseFloat(p.getAngle());
+				for (int i = 0; i < totalBullets; i++) {
+					final float deltaA = (i - (totalBullets - 1) / 2f) * SPREAD;
+					spawnAbilityBullet(realmId, player, effPgId, p,
+							source0.clone(-offset, -offset), baseA + deltaA, rolledDamage, abilityCtx);
+				}
+			}
+			// Self statuses on the projectile-bearing ability (e.g. Bolas Throw doesn't have any,
+			// but pattern accommodates future kits like "fire while ARMORED").
+			if (effHasSelfStatus && effSelfStatus != null) {
+				applyStatusWithFeedback(targetRealm, player, EntityType.PLAYER, effSelfStatus, effSelfDurationMs);
+				for (Object[] xs : extraSelfStatuses) {
+					applyStatusWithFeedback(targetRealm, player, EntityType.PLAYER,
+							(StatusEffectType) xs[0], (Integer) xs[1]);
+				}
+			}
+			return;
+		}
+		// Pure self-buff Ability with no projectile and no AoE tag — just
+		// apply SELF statuses (visual_at_self tag, if any, already emitted
+		// earlier in this method). Without this, line 3230 below NPEs on
+		// abilityItem.getDamage().
+		if (abilityItem == null && ab != null) {
+			if (effHasSelfStatus && effSelfStatus != null) {
+				applyStatusWithFeedback(targetRealm, player, EntityType.PLAYER, effSelfStatus, effSelfDurationMs);
+				for (Object[] xs : extraSelfStatuses) {
+					applyStatusWithFeedback(targetRealm, player, EntityType.PLAYER,
+							(StatusEffectType) xs[0], (Integer) xs[1]);
+				}
+			}
+			return;
+		}
 		if (((abilityItem.getDamage() != null) && (abilityItem.getEffect() != null) && (group != null))) {
 
 			final Vector2f dest = new Vector2f(pos.x, pos.y);
@@ -3253,9 +3153,11 @@ public class RealmManagerServer implements Runnable {
 					rolledDamage = (short) Math.min(Short.MAX_VALUE, Math.max(0, dmg));
 				} else {
 					rolledDamage = abilityItem.getDamage().getInRange();
-					rolledDamage += player.getComputedStats().getStr();
+					// Ability item scaling — same stat indirection as weapons.
+					rolledDamage += statByIndex(player.getComputedStats(),
+							abilityItem.getScalingStat());
 				}
-				rolledDamage = applyCombatDamageMods(rolledDamage, abilityCm);
+				rolledDamage = applyShotDamageMods(rolledDamage, abilityCtx);
 				if (p.getPositionMode() != ProjectilePositionMode.TARGET_PLAYER) {
 					source = dest;
 				} else {
@@ -3284,14 +3186,14 @@ public class RealmManagerServer implements Runnable {
 				// sell the "fell from above" effect — keeps the bullet path
 				// identical to a normal targeted ability.
 				{
-					final int totalBullets = 1 + abilityCm.getExtraProjectiles();
+					final int totalBullets = 1 + abilityCtx.getExtraProjectiles();
 					final float SPREAD = 0.10f;
 					final float baseA = angle + Float.parseFloat(p.getAngle());
 					for (int i = 0; i < totalBullets; i++) {
 						final float deltaA = (i - (totalBullets - 1) / 2f) * SPREAD;
-						final short rolled = applyCombatDamageMods(rolledDamage, abilityCm);
+						final short rolled = applyShotDamageMods(rolledDamage, abilityCtx);
 						spawnAbilityBullet(realmId, player, effPgId, p,
-								source.clone(-offset, -offset), baseA + deltaA, rolled, abilityCm);
+								source.clone(-offset, -offset), baseA + deltaA, rolled, abilityCtx);
 					}
 				}
 			}
@@ -3310,17 +3212,19 @@ public class RealmManagerServer implements Runnable {
 
 				final short offset = (short) (p.getSize() / (short) 2);
 				short rolledDamage = abilityItem.getDamage().getInRange();
-				rolledDamage += player.getComputedStats().getStr();
-				rolledDamage = applyCombatDamageMods(rolledDamage, abilityCm);
+				// Ability item scaling — defaults to STR (4) for legacy items.
+				rolledDamage += statByIndex(player.getComputedStats(),
+						abilityItem.getScalingStat());
+				rolledDamage = applyShotDamageMods(rolledDamage, abilityCtx);
 				{
-					final int totalBullets = 1 + abilityCm.getExtraProjectiles();
+					final int totalBullets = 1 + abilityCtx.getExtraProjectiles();
 					final float SPREAD = 0.10f;
 					final float baseA = Float.parseFloat(p.getAngle());
 					for (int i = 0; i < totalBullets; i++) {
 						final float deltaA = (i - (totalBullets - 1) / 2f) * SPREAD;
-						final short rolled = applyCombatDamageMods(rolledDamage, abilityCm);
+						final short rolled = applyShotDamageMods(rolledDamage, abilityCtx);
 						spawnAbilityBullet(realmId, player, effPgId, p,
-								dest.clone(-offset, -offset), baseA + deltaA, rolled, abilityCm);
+								dest.clone(-offset, -offset), baseA + deltaA, rolled, abilityCtx);
 					}
 				}
 			}
@@ -3375,12 +3279,12 @@ public class RealmManagerServer implements Runnable {
 		}
 	}
 
-	private static short applyCombatDamageMods(short base, CombatModifiers cm) {
+	private static short applyShotDamageMods(short base, ShotContext ctx) {
 		int dmg = base;
-		if (cm.getDamagePct() != 0) dmg = dmg + (dmg * cm.getDamagePct()) / 100;
-		if (cm.getCritChancePct() > 0) {
+		if (ctx.getDamagePct() != 0) dmg = dmg + (dmg * ctx.getDamagePct()) / 100;
+		if (ctx.getCritChancePct() > 0) {
 			final int roll = (int) (Math.random() * 100);
-			if (roll < cm.getCritChancePct()) dmg = dmg * 2;
+			if (roll < ctx.getCritChancePct()) dmg = dmg * 2;
 		}
 		if (dmg < 0) dmg = 0;
 		if (dmg > Short.MAX_VALUE) dmg = Short.MAX_VALUE;
@@ -3388,17 +3292,17 @@ public class RealmManagerServer implements Runnable {
 	}
 
 	private void spawnAbilityBullet(long realmId, Player player, int projectileGroupId, Projectile p,
-			Vector2f src, float angle, short damage, CombatModifiers cm) {
+			Vector2f src, float angle, short damage, ShotContext ctx) {
 		final Bullet b = this.addProjectile(realmId, 0L, player.getId(), projectileGroupId,
 				p.getProjectileId(), src, angle, p.getSize(), p.getMagnitude(), p.getRange(),
 				damage, false, p.getFlags(), p.getAmplitude(), p.getFrequency(), player.getId());
 		if (b == null) return;
 		final List<ProjectileEffect> merged = new ArrayList<>();
 		if (p.getEffects() != null) merged.addAll(p.getEffects());
-		if (cm != null) {
-			for (CombatModifiers.OnHitEffect oh : cm.getOnHitEffects()) {
+		if (ctx != null) {
+			for (ShotContext.OnHitStatus oh : ctx.getOnHitStatuses()) {
 				final ProjectileEffect pe = new ProjectileEffect();
-				pe.setEffectId((short) oh.getEffectId());
+				pe.setEffectId(oh.getEffectId());
 				pe.setDuration(oh.getDurationMs());
 				merged.add(pe);
 			}
@@ -4032,6 +3936,22 @@ public class RealmManagerServer implements Runnable {
 			this.sendTextEffectToPlayer(player, dmgTextEffect, "-" + dmgToInflict);
 
 			player.setHealth(player.getHealth() - dmgToInflict);
+			// Gemstone onPlayerHit hook — Thorns, on-hit-self triggers, etc.
+			if (dmgToInflict > 0) {
+				final Enemy attacker = b.getSrcEntityId() != 0L
+						? targetRealm.getEnemy(b.getSrcEntityId()) : null;
+				for (int slot = 0; slot < Player.EQUIPMENT_SLOT_COUNT; slot++) {
+					final GameItem eq = player.getInventory()[slot];
+					if (eq == null) continue;
+					final Gemstone g = GemstoneRegistry.forItem(eq);
+					if (g != null) g.onPlayerHit(player, dmgToInflict, attacker, eq);
+				}
+			}
+			// Mirror the cast-deduction invalidation: a damage tick that gets
+			// "covered up" by a healer regen before the next 8Hz mark would
+			// leave the cached PlayerStatePacket matching post-regen HP, so
+			// the dip never reaches the client and the HP bar feels frozen.
+			this.playerStateState.remove(player.getId());
 			// Ninja Kage Bunshin — roll AFTER damage (player still eats the
 			// hit, the clone is an escape tool, not a damage shield). Reads
 			// the player's class passive and proc-chance scaling internally.
@@ -4194,24 +4114,13 @@ public class RealmManagerServer implements Runnable {
 			e.setHealth(e.getHealth() - dmgToInflict);
 			int maxHealth = (int) (model.getHealth() * e.getDifficulty());
 			e.setHealthpercent((float) e.getHealth() / (float) maxHealth);
-			// Lifesteal: heal the source player by % of dealt damage from any
-			// gem-equipped item. Currently only the weapon (slot 0) can carry
-			// gems; the legacy ability slot was removed in Phase 1B.
-			if (b.getSrcEntityId() != 0L) {
-				final Player healSrc = this.getPlayerById(b.getSrcEntityId());
-				if (healSrc != null && dmgToInflict > 0) {
-					int totalLifestealPct = 0;
-					if (healSrc.getInventory()[0] != null) {
-						totalLifestealPct += CombatModifiers
-								.fromItem(healSrc.getInventory()[0]).getLifestealPct();
-					}
-					if (totalLifestealPct > 0) {
-						final int heal = (dmgToInflict * totalLifestealPct) / 100;
-						if (heal > 0) {
-							final int maxHp = healSrc.getComputedStats().getHp();
-							healSrc.setHealth(Math.min(maxHp, healSrc.getHealth() + heal));
-						}
-					}
+			// Gemstone onHitTarget hook — lifesteal, bonus statuses, etc. are
+			// owned by individual Gemstone classes now.
+			if (b.getSrcEntityId() != 0L && dmgToInflict > 0) {
+				final Player srcP = this.getPlayerById(b.getSrcEntityId());
+				if (srcP != null && srcP.getInventory()[0] != null) {
+					final Gemstone g = GemstoneRegistry.forItem(srcP.getInventory()[0]);
+					if (g != null) g.onHitTarget(srcP, e, b, dmgToInflict, srcP.getInventory()[0]);
 				}
 			}
 			// Pierce: bows, quivers and stun shields pass through any number of
@@ -4269,9 +4178,10 @@ public class RealmManagerServer implements Runnable {
 			return null;
 		}
 
-		if (!isEnemy && player != null) {
-			damage = (short) (damage + player.getStats().getStr());
-		}
+		// Player-bullet STR scaling lives at the firing site now (basic-attack
+		// uses weapon.scalingStat; ability damage uses Ability scalings or the
+		// abilityItem's scalingStat). addProjectile is item-agnostic so it
+		// must not assume STR — see comment in the ability-data damage path.
 
 		final long idToUse = id == 0l ? Realm.RANDOM.nextLong() : id;
 		final Bullet b = new Bullet(idToUse, projectileId, src, dest, size, magnitude, range, damage, isEnemy);
@@ -4296,10 +4206,7 @@ public class RealmManagerServer implements Runnable {
 			return null;
 		}
 
-		final ProjectileGroup pg = GameDataManager.PROJECTILE_GROUPS.get(projectileGroupId);
-		if (!isEnemy && player != null) {
-			damage = (short) (damage + player.getStats().getStr());
-		}
+		// (No STR auto-add — see comment in the overload above.)
 
 		final long idToUse = id == 0l ? Realm.RANDOM.nextLong() : id;
 		final Bullet b = new Bullet(idToUse, projectileId, src, angle, size, magnitude, range, damage, isEnemy);
@@ -4700,19 +4607,6 @@ public class RealmManagerServer implements Runnable {
 	 * the result is enqueued here and the tick thread integrates it: adds the
 	 * realm, transfers the player, sends map/load packets.
 	 */
-	public static class PendingRealmTransition {
-		public final Realm generatedRealm;
-		public final Player player;
-		public final Realm sourceRealm;
-		public final Portal usedPortal;
-		public PendingRealmTransition(Realm generatedRealm, Player player, Realm sourceRealm, Portal usedPortal) {
-			this.generatedRealm = generatedRealm;
-			this.player = player;
-			this.sourceRealm = sourceRealm;
-			this.usedPortal = usedPortal;
-		}
-	}
-
 	public void enqueuePendingTransition(PendingRealmTransition transition) {
 		this.pendingRealmTransitions.add(transition);
 	}
@@ -4724,23 +4618,25 @@ public class RealmManagerServer implements Runnable {
 		PendingRealmTransition t;
 		while ((t = this.pendingRealmTransitions.poll()) != null) {
 			try {
-				this.addRealm(t.generatedRealm);
-				if (t.usedPortal != null) {
-					t.usedPortal.setToRealmId(t.generatedRealm.getRealmId());
+				final Realm generatedRealm = t.getGeneratedRealm();
+				final Player player = t.getPlayer();
+				this.addRealm(generatedRealm);
+				if (t.getUsedPortal() != null) {
+					t.getUsedPortal().setToRealmId(generatedRealm.getRealmId());
 				}
-				t.player.addEffect(StatusEffectType.INVINCIBLE, 4000);
-				this.broadcastTextEffect(EntityType.PLAYER, t.player,
+				player.addEffect(StatusEffectType.INVINCIBLE, 4000);
+				this.broadcastTextEffect(EntityType.PLAYER, player,
 					TextEffect.PLAYER_INFO, "Invincible");
-				t.generatedRealm.addPlayer(t.player);
-				this.clearPlayerState(t.player.getId());
-				this.invalidateRealmLoadState(t.generatedRealm);
-				ServerGameLogic.sendImmediateLoadMap(this, t.generatedRealm, t.player);
-				ServerGameLogic.onPlayerJoin(this, t.generatedRealm, t.player);
+				generatedRealm.addPlayer(player);
+				this.clearPlayerState(player.getId());
+				this.invalidateRealmLoadState(generatedRealm);
+				ServerGameLogic.sendImmediateLoadMap(this, generatedRealm, player);
+				ServerGameLogic.onPlayerJoin(this, generatedRealm, player);
 				log.info("[SERVER] Completed async realm transition for player {} -> realm {} (mapId={})",
-					t.player.getName(), t.generatedRealm.getRealmId(), t.generatedRealm.getMapId());
+					player.getName(), generatedRealm.getRealmId(), generatedRealm.getMapId());
 			} catch (Exception e) {
 				log.error("[SERVER] Failed to complete realm transition for player {}. Reason: {}",
-					t.player.getName(), e.getMessage(), e);
+					t.getPlayer().getName(), e.getMessage(), e);
 			}
 		}
 	}
@@ -4777,26 +4673,6 @@ public class RealmManagerServer implements Runnable {
 	}
 
 	/**
-	 * Data class for a deferred realm-join operation. Worker threads create these
-	 * after async authentication completes; the tick thread drains and executes
-	 * them before building LoadPackets, guaranteeing no race with the delta logic.
-	 */
-	public static class PendingRealmJoin {
-		public final Realm realm;
-		public final Player player;
-		public final String srcIp;
-		public final ClientSession session;
-		public final Packet loginResponse;
-		public PendingRealmJoin(Realm realm, Player player, String srcIp, ClientSession session, Packet loginResponse) {
-			this.realm = realm;
-			this.player = player;
-			this.srcIp = srcIp;
-			this.session = session;
-			this.loginResponse = loginResponse;
-		}
-	}
-
-	/**
 	 * Called by worker threads after async login auth completes.
 	 * Queues the realm join to be processed on the tick thread.
 	 */
@@ -4813,7 +4689,9 @@ public class RealmManagerServer implements Runnable {
 		PendingRealmJoin join;
 		while ((join = this.pendingRealmJoins.poll()) != null) {
 			try {
-				join.realm.addPlayer(join.player);
+				final Realm welcomeRealm = join.getRealm();
+				final Player toWelcome = join.getPlayer();
+				welcomeRealm.addPlayer(toWelcome);
 				// Only the joining player needs a full Load snapshot built
 				// next tick — neighbors will pick up the new entity through
 				// the natural ledger-vs-viewport delta in enqueueGameData
@@ -4821,17 +4699,15 @@ public class RealmManagerServer implements Runnable {
 				// enemy / 4500-bullet visible set. The previous full-realm
 				// invalidation was the dominant cause of the 10-20 tick
 				// stalls observed when a player logged in mid-stress-test.
-				this.invalidateLoadStateForPlayer(join.player.getId());
-				join.session.setHandshakeComplete(true);
-				this.remoteAddresses.put(join.srcIp, join.player.getId());
-				this.enqueueServerPacket(join.player, join.loginResponse);
-				final Player toWelcome = join.player;
-				final Realm welcomeRealm = join.realm;
+				this.invalidateLoadStateForPlayer(toWelcome.getId());
+				join.getSession().setHandshakeComplete(true);
+				this.remoteAddresses.put(join.getSrcIp(), toWelcome.getId());
+				this.enqueueServerPacket(toWelcome, join.getLoginResponse());
 				WorkerThread.runLater(() -> ServerGameLogic.onPlayerJoin(this, welcomeRealm, toWelcome), 2000);
-				log.info("[SERVER] Processed pending realm join for player {}", join.player.getName());
+				log.info("[SERVER] Processed pending realm join for player {}", toWelcome.getName());
 			} catch (Exception e) {
 				log.error("[SERVER] Failed to process pending realm join for player {}. Reason: {}",
-					join.player.getName(), e.getMessage());
+					join.getPlayer().getName(), e.getMessage());
 			}
 		}
 	}

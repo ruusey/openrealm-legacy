@@ -28,11 +28,15 @@ public class GameItemRefDto extends TemporalDto {
     private String itemUuid;
     private Integer stackCount;
     private List<EnchantmentDto> enchantments;
-    // 0..5; null on legacy records (defaults to COMMON, with rarity migration
-    // bumping items that already carry multiple enchantments).
     private Byte rarity;
     private List<AttributeModifierDto> attributeModifiers;
-
+    // 2026-05-21 — gemstone replaces the old gemSocket* effect quartet.
+    // gemstoneType is a foreign key into GemstoneRegistry; 0 = empty socket.
+    // gemPixel* paint the socketed gem's pixel on the item sprite.
+    private Byte gemstoneType;
+    private Byte gemPixelX;
+    private Byte gemPixelY;
+    private Integer gemPixelColor;
 
     public NetGameItemRef asNetGameItemRef() {
     	return new NetGameItemRef(itemId, slotIdx, itemUuid);

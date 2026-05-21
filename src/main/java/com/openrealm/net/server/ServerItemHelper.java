@@ -126,10 +126,10 @@ public class ServerItemHelper {
                     item.getName(), slotIdx, item.getTargetSlot(), slotIdx);
             return false;
         }
-        final boolean classOk = CharacterClass.isValidUser(player, item.getTargetClass());
+        final boolean classOk = CharacterClass.canEquip(player, item);
         if (!classOk) {
-            log.warn("[canEquipInSlot] reject {} into slot {} — class mismatch: player.classId={} item.targetClass={}",
-                    item.getName(), slotIdx, player.getClassId(), item.getTargetClass());
+            log.warn("[canEquipInSlot] reject {} into slot {} — class mismatch: player.classId={} item.targetClass={} item.itemClass={}",
+                    item.getName(), slotIdx, player.getClassId(), item.getTargetClass(), item.getItemClass());
         }
         return classOk;
     }

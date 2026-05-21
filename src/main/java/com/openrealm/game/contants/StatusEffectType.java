@@ -91,7 +91,22 @@ public enum StatusEffectType {
     /** Heavy Buffer "Guiding Light" aura — DEX half. Mirrors
      *  EMPOWERED_STR but adds to DEX. Always applied alongside
      *  EMPOWERED_STR — two-icon UI is intentional. */
-    EMPOWERED_DEX((short) 35);
+    EMPOWERED_DEX((short) 35),
+    /** Bleed DoT — pure statistical effect (no projectile). While active the
+     *  server drains HP from the affected entity each tick until duration
+     *  elapses. Magnitude per tick lives on the ProjectileEffect instance;
+     *  stack refresh resets duration, not damage. */
+    BLEEDING((short) 36),
+    /** Attack-speed buff. Distinct from BERSERK so kits that grant short
+     *  bursts of fire-rate (e.g. Assassin's Rapid Strikes) don't collide with
+     *  the broader BERSERK buff. Same +50% fire-rate baseline; balance later. */
+    FURY((short) 37),
+    /** Source-scoped vulnerability — pure statistical effect (no projectile).
+     *  While active, damage taken by the affected entity is amplified, but
+     *  ONLY from sources whose party (or self) matches the caster's party at
+     *  apply time. Caster's party id is carried per-instance on the
+     *  ProjectileEffect so cross-party fights don't share the debuff window. */
+    WITHER((short) 38);
 
     public static Map<Short, StatusEffectType> map = new HashMap<>();
     static {

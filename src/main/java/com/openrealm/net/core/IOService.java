@@ -350,7 +350,7 @@ public class IOService {
 							final VarHandle fieldHandle = tempLookup.findVarHandle(clazz, objField.getName(),
 									objField.getType());
 
-							log.info(
+							log.debug(
 									"[IOService::INIT] Successfully located serializable packet field in Class {}. Field: {}. Serializer: {}. isCollection: {}. Order: {}",
 									clazz.getName(), objField.getName(), serializer.getClass(), isCollection, order);
 

@@ -12,20 +12,23 @@ import com.openrealm.net.realm.Realm;
  * Rolls a Rarity and (optionally) a small list of AttributeModifier affixes for
  * a freshly-dropped equipment item. Drop chance per rarity is taken from the
  * enemy's {@code rarityWeights}; if absent, a tier-derived default table is used.
+ *
+ * 2026-05-18: rarity scale changed to MUNDANE..LEGENDARY (was COMMON..MYTHICAL).
+ * Weight tables and modifier bands rebalanced for the new low end.
  */
 public final class LootRarityRoller {
     private LootRarityRoller() {}
 
     private static final int NUM_STATS = 8;
 
-    // Default per-tier rarity weights (COMMON, UNCOMMON, RARE, EPIC, LEGENDARY, MYTHICAL).
-    // Indexed by enemy tier band.
+    // Default per-tier rarity weights, indexed by Rarity ordinal:
+    // MUNDANE, COMMON, UNCOMMON, RARE, EPIC, LEGENDARY.
     private static final float[][] DEFAULT_WEIGHTS_BY_TIER = new float[][] {
-            { 70f, 25f,  4f,  1f,    0f,   0f }, // tier 0–2
-            { 50f, 30f, 15f,  4f,    1f,   0f }, // tier 3–5
-            { 30f, 30f, 25f, 10f,    4f,   1f }, // tier 6–8
-            { 15f, 25f, 30f, 20f,    8f,   2f }, // tier 9–11
-            {  5f, 15f, 30f, 30f,   15f,   5f }, // tier 12+
+            { 60f, 30f, 8f,  2f,   0f,  0f }, // tier 0–2  — mostly mundane
+            { 35f, 40f, 18f, 5f,   2f,  0f }, // tier 3–5
+            { 20f, 30f, 28f, 15f,  5f,  2f }, // tier 6–8
+            { 10f, 20f, 30f, 25f, 11f,  4f }, // tier 9–11
+            {  3f, 12f, 25f, 30f, 20f, 10f }, // tier 12+
     };
 
     private static int tierBand(int tier) {
@@ -44,66 +47,57 @@ public final class LootRarityRoller {
                 : DEFAULT_WEIGHTS_BY_TIER[tierBand(enemyTier)];
         float sum = 0f;
         for (float w : weights) if (w > 0) sum += w;
-        if (sum <= 0f) return Rarity.COMMON;
+        if (sum <= 0f) return Rarity.MUNDANE;
         float roll = Realm.RANDOM.nextFloat() * sum;
         for (int i = 0; i < weights.length; i++) {
             if (weights[i] <= 0) continue;
             roll -= weights[i];
             if (roll <= 0f) return Rarity.fromOrdinal(i);
         }
-        return Rarity.COMMON;
+        return Rarity.MUNDANE;
     }
 
-    /** Roll 0..2 attribute modifiers, with magnitudes scaled by rarity. */
+    /**
+     * Net-neutral prefix roller per the new design doc — Phase 1 placeholder.
+     * Picks two distinct stats and assigns one +X / one -X (same magnitude),
+     * so the total contribution sums to zero. Tuning pass comes later.
+     *
+     * Mundane items roll no prefix. Higher rarities push the magnitude up.
+     */
     public static List<AttributeModifier> rollAttributeModifiers(Rarity rarity) {
-        // Number of modifiers: COMMON 0..1, UNCOMMON 1, RARE 1, EPIC 1..2, LEGENDARY 2, MYTHICAL 2.
-        final int count;
+        if (rarity == Rarity.MUNDANE) return new ArrayList<>();
+
+        final int magCap;
         switch (rarity) {
-        case COMMON:    count = Realm.RANDOM.nextInt(2); break; // 0 or 1
-        case UNCOMMON:
-        case RARE:      count = 1; break;
-        case EPIC:      count = 1 + Realm.RANDOM.nextInt(2); break; // 1 or 2
-        case LEGENDARY:
-        case MYTHICAL:  count = 2; break;
-        default:        count = 0;
-        }
-        if (count == 0) return new ArrayList<>();
-
-        // Magnitude band per rarity. Negative rolls are allowed (Diablo-style ±)
-        // but biased positive at higher rarity so mythicals don't feel cursed.
-        final int magCap = Math.max(1, rarity.ordinal()); // 1..5
-        final float negChance;
-        switch (rarity) {
-        case COMMON:    negChance = 0.35f; break;
-        case UNCOMMON:  negChance = 0.25f; break;
-        case RARE:      negChance = 0.15f; break;
-        case EPIC:      negChance = 0.10f; break;
-        case LEGENDARY: negChance = 0.05f; break;
-        case MYTHICAL:  negChance = 0.0f;  break;
-        default:        negChance = 0.30f;
+        case COMMON:    magCap = 1; break;
+        case UNCOMMON:  magCap = 2; break;
+        case RARE:      magCap = 3; break;
+        case EPIC:      magCap = 4; break;
+        case LEGENDARY: magCap = 5; break;
+        default:        magCap = 1;
         }
 
-        final List<AttributeModifier> out = new ArrayList<>(count);
-        final boolean[] usedStats = new boolean[NUM_STATS];
-        for (int i = 0; i < count; i++) {
-            byte statId;
-            int tries = 0;
-            do {
-                statId = (byte) Realm.RANDOM.nextInt(NUM_STATS);
-                if (++tries > 16) break;
-            } while (usedStats[statId]);
-            usedStats[statId] = true;
+        final byte statPos = (byte) Realm.RANDOM.nextInt(NUM_STATS);
+        byte statNeg;
+        int safety = 0;
+        do {
+            statNeg = (byte) Realm.RANDOM.nextInt(NUM_STATS);
+            if (++safety > 16) break;
+        } while (statNeg == statPos);
 
-            int mag = 1 + Realm.RANDOM.nextInt(magCap);
-            // HP/MP scale much larger than the other stats; scale up so a +1 isn't lost.
-            if (statId == 2 || statId == 3) mag *= 5;
-            final boolean negative = Realm.RANDOM.nextFloat() < negChance;
-            if (negative) mag = -mag;
-            // Clamp to byte range
-            if (mag > Byte.MAX_VALUE) mag = Byte.MAX_VALUE;
-            if (mag < Byte.MIN_VALUE) mag = Byte.MIN_VALUE;
-            out.add(new AttributeModifier(statId, (byte) mag));
-        }
+        int mag = 1 + Realm.RANDOM.nextInt(magCap);
+        // HP/MP stats scale much larger than the other stats; scale up so the
+        // visible prefix actually means something on those stats.
+        int magPos = mag;
+        int magNeg = mag;
+        if (statPos == 2 || statPos == 3) magPos *= 5;
+        if (statNeg == 2 || statNeg == 3) magNeg *= 5;
+        if (magPos > Byte.MAX_VALUE) magPos = Byte.MAX_VALUE;
+        if (magNeg > Byte.MAX_VALUE) magNeg = Byte.MAX_VALUE;
+
+        final List<AttributeModifier> out = new ArrayList<>(2);
+        out.add(new AttributeModifier(statPos, (byte) magPos));
+        out.add(new AttributeModifier(statNeg, (byte) -magNeg));
         return out;
     }
 

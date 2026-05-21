@@ -1,0 +1,12 @@
+  I need you to deeply investigate my game openrealm and its three codebases. game server at ../openrealm. The native
+  client is at ../openrealm-native-client. The webclient is located in this directory as static javascript and html along
+  with the player data service which handles saving player data and serving the game data resources and game webclient. 
+  
+  Okay and after we make changed i need need you to commit the changes to all changed repos. The native client has a build pipeline that builds an EXE
+  based on the version in the pom. so thats one release flow triggered by tag. And then openrealm and openrealm-data
+  are built and uploaded to the remote prod using deploy-remote.bat all. Please make sure you understand the release
+  flows so we can do iterative testing on all fronts, game server, webclient, native client - If needed. When you change the json game 
+  data files(we mount those to /opt/openrealm-data/data) for remote loading and modification of the data). Theres a script to do that as well (deploy-data.bat). 
+  Those data files are also mounted under C:/ for local testing. Any changes you make to the data files or sprites needs to get mounted there. 
+
+  Notes: No fully qualified java class names or static inline classes in other classes.

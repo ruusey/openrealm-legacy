@@ -10,6 +10,8 @@ import com.openrealm.game.entity.Player;
 import com.openrealm.game.entity.item.Enchantment;
 import com.openrealm.game.entity.item.GameItem;
 import com.openrealm.game.entity.item.Rarity;
+import com.openrealm.game.entity.item.gem.Gemstone;
+import com.openrealm.game.entity.item.gem.GemstoneRegistry;
 import com.openrealm.game.model.TileModel;
 import com.openrealm.game.tile.Tile;
 import com.openrealm.game.tile.TileMap;
@@ -54,11 +56,11 @@ public class ServerForgeHelper {
     };
 
     /**
-     * Hard ceiling — actual cap is per-item from {@link com.openrealm.game.entity.item.Rarity#gemSlots}.
+     * Hard ceiling — actual cap is per-item from {@link com.openrealm.game.entity.item.Rarity#crystalSlots}.
      * Kept as a sanity floor so a misconfigured rarity ordinal cannot exceed
      * the original design bound.
      */
-    public static final int MAX_ENCHANTMENTS_PER_ITEM = 6;
+    public static final int MAX_ENCHANTMENTS_PER_ITEM = 5;
     public static final int ENCHANT_ESSENCE_COST = 50;
     public static final int SHARDS_PER_CRYSTAL = 10;
     // HP and MP scale into the hundreds, so a +1 enchantment is essentially
@@ -220,96 +222,92 @@ public class ServerForgeHelper {
                     player.getId(), essence.getStackCount(), ENCHANT_ESSENCE_COST);
             return;
         }
-        // Enchantment cap: rarity-driven. A COMMON item allows 1 gem,
-        // MYTHICAL allows 6. Legacy items with more enchantments than their
-        // (recently-introduced) rarity allows have already been migrated to
-        // a higher rarity at load — see GameItem.fromGameItemRef.
-        List<Enchantment> existing = target.getEnchantments();
-        if (existing == null) existing = new ArrayList<>();
-        final int rarityCap = target.getMaxEnchantments();
-        if (existing.size() >= rarityCap) {
-            log.warn("[Forge] Item {} at rarity cap ({} slots for {})", target.getName(),
-                    rarityCap, Rarity.fromOrdinal(target.getRarity()).displayName);
-            return;
-        }
-        // Pixel must not already be enchanted
-        for (Enchantment e : existing) {
-            if (e.getPixelX() == p.getPixelX() && e.getPixelY() == p.getPixelY()) {
-                log.warn("[Forge] Pixel ({},{}) already enchanted on {}", p.getPixelX(), p.getPixelY(), target.getName());
-                return;
-            }
-        }
-        // Build the enchantment from either a stat crystal or a typed gem.
-        final Enchantment newEnch;
+        // Gems take the single EPIC+ socket. Crystals consume a rarity-driven
+        // crystal slot. Both paint a pixel on the sprite.
         if (isGem) {
-            final byte gemEffect = crystal.getGemEffectType();
-            if (gemEffect < 0) {
-                log.warn("[Forge] Gem {} has no gemEffectType", crystal.getName());
+            if (!Rarity.hasGemSocket(target.getRarity())) {
+                log.warn("[Forge] Item {} (rarity {}) cannot socket gems", target.getName(),
+                        Rarity.fromOrdinal(target.getRarity()).displayName);
                 return;
             }
-            // For gems, pixelColor follows STAT_COLORS when the gem still
-            // targets a stat, otherwise we use a neutral indicator color
-            // keyed by effectType ordinal so the painted pixel stays
-            // visually distinct.
-            final byte gp1 = crystal.getGemParam1();
-            final int color = (gemEffect == 0 || gemEffect == 1) && gp1 >= 0 && gp1 <= 7
-                    ? STAT_COLORS[gp1]
-                    : gemEffectColor(gemEffect);
-            newEnch = new Enchantment(
-                    /*statId*/ (byte) (gemEffect == 0 ? gp1 : 0),
-                    /*deltaValue*/ (byte) (gemEffect == 0 ? Math.min(Byte.MAX_VALUE, crystal.getGemMagnitude()) : 0),
-                    /*pixelX*/ p.getPixelX(),
-                    /*pixelY*/ p.getPixelY(),
-                    /*pixelColor*/ color,
-                    gemEffect,
-                    gp1,
-                    crystal.getGemMagnitude(),
-                    crystal.getGemDurationMs());
+            if (target.getGemstoneType() != 0) {
+                log.warn("[Forge] Item {} already has a gem socketed", target.getName());
+                return;
+            }
+            final byte gType = crystal.getGemstoneType();
+            final Gemstone gem = GemstoneRegistry.get(gType);
+            if (gem == null) {
+                log.warn("[Forge] Gem item {} has no gemstoneType (or unknown type {})", crystal.getName(), gType);
+                return;
+            }
+            if (!gem.canSocketInto(target)) {
+                log.warn("[Forge] Gem {} cannot socket into {}", gem.displayName(), target.getName());
+                return;
+            }
+            // The gem socket consumes the same pixel-paint UI as a crystal —
+            // refuse if the chosen pixel is already painted.
+            final List<Enchantment> cur = target.getEnchantments() != null
+                    ? target.getEnchantments() : new ArrayList<>();
+            for (Enchantment e : cur) {
+                if (e.getPixelX() == p.getPixelX() && e.getPixelY() == p.getPixelY()) {
+                    log.warn("[Forge] Pixel ({},{}) already enchanted on {}", p.getPixelX(), p.getPixelY(), target.getName());
+                    return;
+                }
+            }
+            player.getInventory()[crystalSlot] = null;
+            if (isUniversalEssence || essence.getStackCount() == ENCHANT_ESSENCE_COST) {
+                player.getInventory()[essenceSlot] = null;
+            } else {
+                essence.setStackCount(essence.getStackCount() - ENCHANT_ESSENCE_COST);
+            }
+            target.setGemstoneType(gType);
+            target.setGemPixelX(p.getPixelX());
+            target.setGemPixelY(p.getPixelY());
+            target.setGemPixelColor(gem.paintColor());
+            log.info("[Forge] Player {} socketed {} into {} (rarity {})",
+                    player.getId(), gem.displayName(), target.getName(),
+                    Rarity.fromOrdinal(target.getRarity()).displayName);
         } else {
             final byte statId = crystal.getForgeStatId();
             if (statId < 0 || statId > 7) {
                 log.warn("[Forge] Crystal {} has invalid forgeStatId {}", crystal.getName(), statId);
                 return;
             }
-            // HP/MP get a +5 delta because their stat scale is much larger than the other six.
+            List<Enchantment> existing = target.getEnchantments();
+            if (existing == null) existing = new ArrayList<>();
+            final int rarityCap = target.getMaxEnchantments();
+            if (existing.size() >= rarityCap) {
+                log.warn("[Forge] Item {} at rarity cap ({} slots for {})", target.getName(),
+                        rarityCap, Rarity.fromOrdinal(target.getRarity()).displayName);
+                return;
+            }
+            for (Enchantment e : existing) {
+                if (e.getPixelX() == p.getPixelX() && e.getPixelY() == p.getPixelY()) {
+                    log.warn("[Forge] Pixel ({},{}) already enchanted on {}", p.getPixelX(), p.getPixelY(), target.getName());
+                    return;
+                }
+            }
+            // HP/MP get a +5 delta because their stat scale is much larger.
             final int color = STAT_COLORS[statId];
             final byte delta = (statId == 2 || statId == 3)
                     ? (byte) HP_MP_ENCHANT_DELTA
                     : (byte) DEFAULT_ENCHANT_DELTA;
-            newEnch = new Enchantment(statId, delta, p.getPixelX(), p.getPixelY(), color);
+            final Enchantment newEnch = new Enchantment(statId, delta, p.getPixelX(), p.getPixelY(), color);
+            player.getInventory()[crystalSlot] = null;
+            if (isUniversalEssence || essence.getStackCount() == ENCHANT_ESSENCE_COST) {
+                player.getInventory()[essenceSlot] = null;
+            } else {
+                essence.setStackCount(essence.getStackCount() - ENCHANT_ESSENCE_COST);
+            }
+            existing.add(newEnch);
+            target.setEnchantments(existing);
+            log.info("[Forge] Player {} enchanted {} with statId={} delta={} at pixel ({},{}) (now {}/{} slots)",
+                    player.getId(), target.getName(), statId, delta,
+                    p.getPixelX(), p.getPixelY(), existing.size(), rarityCap);
         }
-
-        // Deduct cost: remove crystal/gem entirely; universal essence is removed
-        // entirely too, typed essence is decremented by 50 (or removed if exact).
-        player.getInventory()[crystalSlot] = null;
-        if (isUniversalEssence || essence.getStackCount() == ENCHANT_ESSENCE_COST) {
-            player.getInventory()[essenceSlot] = null;
-        } else {
-            essence.setStackCount(essence.getStackCount() - ENCHANT_ESSENCE_COST);
-        }
-
-        existing.add(newEnch);
-        target.setEnchantments(existing);
-
-        log.info("[Forge] Player {} enchanted {} with effectType={} at pixel ({},{}) (now {}/{} slots)",
-                player.getId(), target.getName(), newEnch.getEffectType(),
-                p.getPixelX(), p.getPixelY(), existing.size(), rarityCap);
 
         sendInventoryUpdate(mgr, realm, player);
-        // Persist immediately so a crash/disconnect doesn't lose the new enchantment
         mgr.persistPlayerAsync(player);
-    }
-
-    /** Visual fallback color for non-stat gem effects. */
-    private static int gemEffectColor(byte effectType) {
-        switch (effectType) {
-        case 2: return 0xFFFFD700; // PROJECTILE_COUNT — gold
-        case 3: return 0xFFFF4040; // PROJECTILE_DAMAGE — red
-        case 4: return 0xFFA040FF; // ON_HIT_EFFECT — purple
-        case 5: return 0xFF40FF80; // LIFESTEAL — green
-        case 6: return 0xFFFFA000; // CRIT_CHANCE — orange
-        default: return 0xFFFFFFFF;
-        }
     }
 
     public static void handleForgeDisenchant(RealmManagerServer mgr, Packet packet) throws Exception {
@@ -323,12 +321,18 @@ public class ServerForgeHelper {
         if (targetSlot < 0 || targetSlot >= player.getInventory().length) return;
         final GameItem target = player.getInventory()[targetSlot];
         if (target == null) return;
-        if (target.getEnchantments() == null || target.getEnchantments().isEmpty()) return;
+        final boolean hadCrystals = target.getEnchantments() != null && !target.getEnchantments().isEmpty();
+        final boolean hadSocket = target.getGemstoneType() != 0;
+        if (!hadCrystals && !hadSocket) return;
 
-        final int removed = target.getEnchantments().size();
+        final int removed = hadCrystals ? target.getEnchantments().size() : 0;
         target.setEnchantments(new ArrayList<>());
-        log.info("[Forge] Player {} disenchanted {} (removed {} enchantments)",
-                player.getId(), target.getName(), removed);
+        target.setGemstoneType((byte) 0);
+        target.setGemPixelX((byte) 0);
+        target.setGemPixelY((byte) 0);
+        target.setGemPixelColor(0);
+        log.info("[Forge] Player {} disenchanted {} (removed {} enchantments, socket: {})",
+                player.getId(), target.getName(), removed, hadSocket ? "cleared" : "none");
 
         sendInventoryUpdate(mgr, realm, player);
         mgr.persistPlayerAsync(player);
