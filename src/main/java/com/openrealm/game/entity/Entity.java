@@ -185,6 +185,22 @@ public abstract class Entity extends GameObject {
                 && duration != Long.MAX_VALUE) {
             effDuration = duration * 2L;
         }
+        // Trapper "Knowhow" (passive 12004) — incoming debuff durations are
+        // shortened by (20 + DEX/10)%, capped at ~70% so debuffs can't be
+        // reduced to zero. Applies AFTER VULNERABLE doubling so the two
+        // effects compose multiplicatively.
+        if (DEBUFF_IDS.contains(effect.effectId)
+                && effDuration != Long.MAX_VALUE
+                && this instanceof com.openrealm.game.entity.Player) {
+            final com.openrealm.game.entity.Player _p = (com.openrealm.game.entity.Player) this;
+            final com.openrealm.game.model.ability.PassiveAbility _pass = _p.getClassPassive();
+            if (_pass != null && _pass.getId() == 12004) {
+                final int dex = _p.getComputedStats().getDex();
+                final int reductionPct = Math.min(70, 20 + dex / 10);
+                effDuration = (effDuration * (100 - reductionPct)) / 100;
+                if (effDuration < 50) effDuration = 50; // sanity floor
+            }
+        }
         final long expireTime = (effDuration == Long.MAX_VALUE)
                 ? Long.MAX_VALUE
                 : Instant.now().toEpochMilli() + effDuration;

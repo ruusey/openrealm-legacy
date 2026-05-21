@@ -737,7 +737,7 @@ public class ServerGameLogic {
 					rolledDamage = (short) Math.min(Short.MAX_VALUE,
 							Math.max(0, (int) (rolledDamage * arch.getDamageMul())));
 				}
-				rolledDamage = applyShotDamageMods(rolledDamage, ctx);
+				rolledDamage = CombatMath.applyShotDamageMods(rolledDamage, ctx);
 				if (empoweredShot) {
 					rolledDamage = (short) Math.min(Short.MAX_VALUE, (int) (rolledDamage * 1.5f));
 				}
@@ -748,7 +748,7 @@ public class ServerGameLogic {
 						? arch.getSpreadRad() : 0.12f) + ctx.getExtraSpread();
 				for (int i = 0; i < totalBullets; i++) {
 					final float deltaA = (i - (totalBullets - 1) / 2f) * SPREAD;
-					final short dmg = (i == 0) ? rolledDamage : applyShotDamageMods(rolledDamage, ctx);
+					final short dmg = (i == 0) ? rolledDamage : CombatMath.applyShotDamageMods(rolledDamage, ctx);
 					spawnPlayerBullet(mgr, realm.getRealmId(), player, weaponPgId, proj,
 							source.clone(-offset, -offset), shootAngle + deltaA, dmg, ctx, arch);
 				}
@@ -772,18 +772,6 @@ public class ServerGameLogic {
 			case 7: return s.getDex();
 			default: return s.getStr();
 		}
-	}
-
-	private static short applyShotDamageMods(short base, ShotContext ctx) {
-		int dmg = base;
-		if (ctx.getDamagePct() != 0) dmg = dmg + (dmg * ctx.getDamagePct()) / 100;
-		if (ctx.getCritChancePct() > 0) {
-			final int roll = (int) (Math.random() * 100);
-			if (roll < ctx.getCritChancePct()) dmg = dmg * 2;
-		}
-		if (dmg < 0) dmg = 0;
-		if (dmg > Short.MAX_VALUE) dmg = Short.MAX_VALUE;
-		return (short) dmg;
 	}
 
 	private static void spawnPlayerBullet(RealmManagerServer mgr, long realmId, Player player, int weaponPgId,

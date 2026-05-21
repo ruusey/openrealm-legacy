@@ -116,6 +116,7 @@ import com.openrealm.net.entity.NetTile;
 import com.openrealm.net.entity.NetObjectMovement;
 import com.openrealm.net.messaging.ServerCommandMessage;
 import com.openrealm.net.server.ClientSession;
+import com.openrealm.net.server.CombatMath;
 import com.openrealm.net.server.NioServer;
 import com.openrealm.net.server.ServerCommandHandler;
 import com.openrealm.net.server.ServerGameLogic;
@@ -1995,93 +1996,11 @@ public class RealmManagerServer implements Runnable {
 			realm.processClones(this);
 		}
 
-		// Passive tick — runs every 8 ticks (~125ms). Refreshes:
-		//   • Priest Protective Aura (11003): PROTECTED on every player in 5
-		//     tiles of the priest, including the priest themselves.
-		//   • Paladin Holy Resolve (11006): BRACED on the paladin while their
-		//     HP is below 50% of max. The buff naturally drops when they heal
-		//     back above the threshold because we stop refreshing it.
-		// Both refresh with a short duration (~800ms) so the buff decays
-		// cleanly when the condition stops holding.
-		if (this.tickCounter % 8 == 0) {
-			final float AURA_RADIUS = 320f;
-			final float AURA_RADIUS_SQ = AURA_RADIUS * AURA_RADIUS;
-			final long  REFRESH_MS = 800L;
-			for (final Realm realm : this.realms.values()) {
-				if (realm.getPlayers().isEmpty()) continue;
-				for (final Player p : realm.getPlayers().values()) {
-					final PassiveAbility pa = p.getClassPassive();
-					if (pa == null) continue;
-					if (pa.getId() == 11003) {
-						// Priest Protective Aura
-						final Vector2f pc = p.getPos().clone(p.getSize() / 2, p.getSize() / 2);
-						for (final Player ally : realm.getPlayers().values()) {
-							final Vector2f ac = ally.getPos().clone(ally.getSize() / 2, ally.getSize() / 2);
-							final float dx = ac.x - pc.x, dy = ac.y - pc.y;
-							if (dx * dx + dy * dy > AURA_RADIUS_SQ) continue;
-							ally.addEffect(StatusEffectType.PROTECTED, REFRESH_MS);
-						}
-					} else if (pa.getId() == 11006) {
-						// Paladin Holy Resolve — refresh BRACED while HP < 50%
-						// of computed max. ARMORED/BRACED in Player.getComputedStats
-						// is mutually exclusive (ARMORED > BRACED), so this won't
-						// downgrade a Brace cast.
-						final int maxHp = p.getComputedStats() != null ? p.getComputedStats().getHp() : p.getHealth();
-						if (maxHp > 0 && p.getHealth() * 2 < maxHp) {
-							p.addEffect(StatusEffectType.BRACED, REFRESH_MS);
-						}
-					} else if (pa.getId() == 11015) {
-						// Heavy Buffer "Guiding Light" — refresh EMPOWERED_STR and
-						// EMPOWERED_DEX on every party member within range INCLUDING
-						// the buffer itself (realm.getPlayers() contains the caster).
-						// Magnitude = floor(caster.WIS / GUIDING_LIGHT_WIS_DIVISOR).
-						// Two parallel statuses so the UI stacks two icons above
-						// the player ("Atk+10" and "Dex+10") instead of one combined
-						// label — design call from the buffer playtest.
-						final Vector2f pc = p.getPos().clone(p.getSize() / 2, p.getSize() / 2);
-						final short bonus = (short) Math.max(0,
-								p.getComputedStats().getWis() / GUIDING_LIGHT_WIS_DIVISOR);
-						for (final Player ally : realm.getPlayers().values()) {
-							final Vector2f ac = ally.getPos().clone(ally.getSize() / 2, ally.getSize() / 2);
-							final float dx = ac.x - pc.x, dy = ac.y - pc.y;
-							if (dx * dx + dy * dy > AURA_RADIUS_SQ) continue;
-							// Floating "+N STR" / "+N DEX" cast text — only on the
-							// first application (transition from no-EMPOWERED to
-							// has-EMPOWERED). Without this guard we'd flood the
-							// screen with text every 125ms tick while standing
-							// inside the aura. We check EMPOWERED_STR as the proxy
-							// for "did this player just enter the aura" since both
-							// statuses always apply together.
-							if (bonus > 0 && !ally.hasEffect(StatusEffectType.EMPOWERED_STR)) {
-								this.broadcastTextEffect(realm, EntityType.PLAYER, ally,
-										TextEffect.HEAL, "+" + bonus + " STR");
-								this.broadcastTextEffect(realm, EntityType.PLAYER, ally,
-										TextEffect.HEAL, "+" + bonus + " DEX");
-							}
-							ally.addEffect(StatusEffectType.EMPOWERED_STR, REFRESH_MS, bonus);
-							ally.addEffect(StatusEffectType.EMPOWERED_DEX, REFRESH_MS, bonus);
-						}
-					} else if (pa.getId() == 11008) {
-						// Necromancer Necrotic Aura — continuously refreshes CURSED
-						// (1.25× damage taken) on every enemy in range. Range is
-						// ~1.6 tiles (≈1/3 of the priest aura), so the necro has
-						// to actively kite into melee to use it instead of just
-						// camping a pack from across the screen.
-						final float NECRO_AURA_R = AURA_RADIUS / 3f;
-						final float NECRO_AURA_SQ = NECRO_AURA_R * NECRO_AURA_R;
-						final Vector2f pc = p.getPos().clone(p.getSize() / 2, p.getSize() / 2);
-						for (final Enemy enemy : realm.getEnemies().values()) {
-							if (enemy == null || enemy.getDeath()) continue;
-							if (enemy.hasEffect(StatusEffectType.INVINCIBLE)) continue;
-							final float dx = enemy.getPos().x - pc.x;
-							final float dy = enemy.getPos().y - pc.y;
-							if (dx * dx + dy * dy > NECRO_AURA_SQ) continue;
-							enemy.addEffect(StatusEffectType.CURSED, REFRESH_MS);
-						}
-					}
-				}
-			}
-		}
+		// Passive tick — extracted to ServerPassiveTickHelper. Refreshes the
+		// per-class always-on auras (Priest Protective, Paladin Holy Resolve,
+		// Heavy Buffer / Paladin Guiding Light, Necromancer Necrotic). Runs
+		// internally on its own 125ms cadence.
+		ServerPassiveTickHelper.tick(this, this.tickCounter);
 
 		// (Persistent-effect tick loops removed 2026-05-19 — see TODO at top of
 		// this file. The Necromancer Soul Harvest vortex, Ninja Blade Storm
@@ -2252,7 +2171,11 @@ public class RealmManagerServer implements Runnable {
 
 		// Process ALL queued inputs this tick. At high ping, inputs arrive in
 		// bursts — processing all of them prevents server position from drifting
-		// behind the client. Capped at 8 per tick (125ms catch-up) to prevent abuse.
+		// behind the client. Cap raised to 32 per tick (~500ms catch-up window)
+		// because 8 was too tight: any sustained network blip would queue more
+		// than 8 and the surplus piled up across multiple ticks, leaving the
+		// server N ticks behind the client and forcing an ack snapback.
+		// Per-tick safety still comes from applyMovementTick's |v|<=1 clamp.
 		if (p.getInputQueue() == null) p.setInputQueue(new ConcurrentLinkedQueue<>());
 		while (!p.getInputQueue().isEmpty() && (int) p.getInputQueue().peek()[0] <= p.getLastProcessedInputSeq()) {
 		    p.getInputQueue().poll();
@@ -2260,7 +2183,7 @@ public class RealmManagerServer implements Runnable {
 
 		final Realm targetRealm = this.realms.get(realmId);
 		int processed = 0;
-		while (!p.getInputQueue().isEmpty() && processed < 8) {
+		while (!p.getInputQueue().isEmpty() && processed < 32) {
 		    float[] nextInput = p.getInputQueue().poll();
 		    p.setCurrentVx(nextInput[1]);
 		    p.setCurrentVy(nextInput[2]);
@@ -2548,6 +2471,19 @@ public class RealmManagerServer implements Runnable {
 			effSelfStatus     = null;
 			effSelfDurationMs = 0;
 			effHasSelfStatus  = false;
+			// Resolve DURATION-target scalings once so each SELF status here
+			// (and the projectile/aoe branches farther down) extends correctly
+			// by the caster's stat. Without this Ninja Smokebomb's 13.33 DEX
+			// coeff DURATION scaling was discarded and INVISIBLE/SPEEDY stayed
+			// at their raw baseDurationMs no matter how much DEX the player had.
+			int selfDurationBonusMs = 0;
+			if (ab.getScalings() != null) {
+				for (AbilityScaling sc : ab.scalingList()) {
+					if (!"DURATION".equalsIgnoreCase(sc.getTarget())) continue;
+					final int statVal = resolveScalingInput(player, ab, sc);
+					selfDurationBonusMs += (int) sc.curveEnum().apply(statVal, sc.getCoeff(), sc.getCap());
+				}
+			}
 			for (AbilityEffect e : ab.effectList()) {
 				final String t = e.getType();
 				if (t == null) continue;
@@ -2558,12 +2494,13 @@ public class RealmManagerServer implements Runnable {
 						final short sid = Short.parseShort(String.valueOf(e.getStatusId()).trim());
 						final StatusEffectType st = StatusEffectType.map.get(sid);
 						if (st != null) {
+							final int dur = (int) e.getBaseDurationMs() + selfDurationBonusMs;
 							if (!effHasSelfStatus) {
 								effSelfStatus    = st;
-								effSelfDurationMs = (int) e.getBaseDurationMs();
+								effSelfDurationMs = dur;
 								effHasSelfStatus = true;
 							} else {
-								extraSelfStatuses.add(new Object[] { st, (int) e.getBaseDurationMs() });
+								extraSelfStatuses.add(new Object[] { st, dur });
 							}
 						}
 					} catch (NumberFormatException ignore) { /* non-numeric statusId — Phase 2D resolves via enum name */ }
@@ -2937,8 +2874,32 @@ public class RealmManagerServer implements Runnable {
 			// only covers the ability-side "armor_pierce" tag (applies to all
 			// targets uniformly).
 			final TextEffect dmgTextEffectBase = armorPierce ? TextEffect.ARMOR_BREAK : TextEffect.DAMAGE;
-			// Enemy branch — only when this isn't an ally-targeted AoE.
-			if (aoeTargeted && !aoeAlly) {
+			// Enemy branch — runs whenever the ability is aoe_targeted. Used to
+			// be gated by `!aoeAlly` (mutually exclusive enemy/ally branches),
+			// which broke abilities that legitimately do BOTH — e.g. Necro Soul
+			// Drain debuffs nearby enemies AND grants MANA_FOUNT to nearby
+			// allies in one cast. The effect/scaling lists already filter by
+			// target (ENEMIES_HIT vs ALLIES_HIT), so running both branches is
+			// safe and matches the data.
+			if (aoeTargeted) {
+				// Compute the debuff-duration bonus ONCE per cast: ability's
+				// DURATION-target scalings (e.g. Wither's WIS*20) + the
+				// Necromancer "Cost of Living" passive's WIS/50s extension to
+				// any party debuff the player applies. Without this, Wither's
+				// status durations stayed at their raw baseDurationMs and the
+				// passive was a silent no-op (passives.json had no triggers).
+				int debuffBonusMs = 0;
+				if (ab.getScalings() != null) {
+					for (AbilityScaling sc : ab.scalingList()) {
+						if (!"DURATION".equalsIgnoreCase(sc.getTarget())) continue;
+						final int statVal = resolveScalingInput(player, ab, sc);
+						debuffBonusMs += (int) sc.curveEnum().apply(statVal, sc.getCoeff(), sc.getCap());
+					}
+				}
+				final PassiveAbility _cp = player.getClassPassive();
+				if (_cp != null && _cp.getId() == 12005 /* Necromancer Cost of Living */) {
+					debuffBonusMs += (player.getComputedStats().getWis() / 50) * 1000;
+				}
 				final List<Enemy> dead = new ArrayList<>();
 				for (final Enemy enemy : targetRealm.getEnemies().values()) {
 					if (enemy.getDeath()) continue;
@@ -2953,7 +2914,7 @@ public class RealmManagerServer implements Runnable {
 									Short.parseShort(String.valueOf(aoeEff.getStatusId()).trim()));
 							if (st != null) {
 								applyStatusWithFeedback(targetRealm, enemy, EntityType.ENEMY,
-										st, aoeEff.getBaseDurationMs());
+										st, aoeEff.getBaseDurationMs() + debuffBonusMs);
 							}
 						} catch (NumberFormatException ignore) { }
 					}
@@ -2988,6 +2949,14 @@ public class RealmManagerServer implements Runnable {
 					if (!"HEAL".equalsIgnoreCase(sc.getTarget())) continue;
 					final int statVal = resolveScalingInput(player, ab, sc);
 					healAmount += (int) sc.curveEnum().apply(statVal, sc.getCoeff(), sc.getCap());
+				}
+				// Priest "Blessed One" (12008) — healing this player applies is
+				// amplified by (WIS)%. Applied AFTER scalings so it acts as a
+				// final multiplier on the total heal, not just the flat base.
+				final PassiveAbility _bocp = player.getClassPassive();
+				if (_bocp != null && _bocp.getId() == 12008 && healAmount > 0) {
+					final int wis = player.getComputedStats().getWis();
+					healAmount = healAmount + (healAmount * wis) / 100;
 				}
 				int cleansedSoFar = 0;
 				for (final Player ally : targetRealm.getPlayers().values()) {
@@ -3089,7 +3058,33 @@ public class RealmManagerServer implements Runnable {
 				final int statVal = resolveScalingInput(player, ab, sc);
 				dmg += (int) sc.curveEnum().apply(statVal, sc.getCoeff(), sc.getCap());
 			}
-			final short rolledDamage = applyShotDamageMods(
+			// Resolve DURATION-target scalings + Necromancer "Cost of Living"
+			// passive bonus, then fold the ability's STATUS_APPLY ENEMIES_HIT
+			// entries into the ShotContext so spawned bullets actually apply
+			// the declared debuffs on contact. Previously the projectile
+			// branch only read p.getEffects() from the projectile-group def,
+			// so any STATUS_APPLY listed on the Ability itself was a no-op
+			// (Necro Wretch's WEAKEN + SLOWED never landed).
+			int _projDebuffBonusMs = 0;
+			for (AbilityScaling sc : ab.scalingList()) {
+				if (!"DURATION".equalsIgnoreCase(sc.getTarget())) continue;
+				final int statVal = resolveScalingInput(player, ab, sc);
+				_projDebuffBonusMs += (int) sc.curveEnum().apply(statVal, sc.getCoeff(), sc.getCap());
+			}
+			final PassiveAbility _cpProj = player.getClassPassive();
+			if (_cpProj != null && _cpProj.getId() == 12005 /* Cost of Living */) {
+				_projDebuffBonusMs += (player.getComputedStats().getWis() / 50) * 1000;
+			}
+			for (AbilityEffect aoeEff : ab.effectList()) {
+				if (!"STATUS_APPLY".equalsIgnoreCase(aoeEff.getType())) continue;
+				if (!"ENEMIES_HIT".equalsIgnoreCase(aoeEff.getTarget())) continue;
+				try {
+					final short statusId = Short.parseShort(String.valueOf(aoeEff.getStatusId()).trim());
+					final int durMs = (int) Math.min(Integer.MAX_VALUE, aoeEff.getBaseDurationMs() + _projDebuffBonusMs);
+					abilityCtx.addOnHitStatus(statusId, durMs);
+				} catch (NumberFormatException ignore) { }
+			}
+			final short rolledDamage = CombatMath.applyShotDamageMods(
 					(short) Math.min(Short.MAX_VALUE, Math.max(0, dmg)), abilityCtx);
 			for (final Projectile p : group.getProjectiles()) {
 				final short offset = (short) (p.getSize() / (short) 2);
@@ -3157,7 +3152,7 @@ public class RealmManagerServer implements Runnable {
 					rolledDamage += statByIndex(player.getComputedStats(),
 							abilityItem.getScalingStat());
 				}
-				rolledDamage = applyShotDamageMods(rolledDamage, abilityCtx);
+				rolledDamage = CombatMath.applyShotDamageMods(rolledDamage, abilityCtx);
 				if (p.getPositionMode() != ProjectilePositionMode.TARGET_PLAYER) {
 					source = dest;
 				} else {
@@ -3191,7 +3186,7 @@ public class RealmManagerServer implements Runnable {
 					final float baseA = angle + Float.parseFloat(p.getAngle());
 					for (int i = 0; i < totalBullets; i++) {
 						final float deltaA = (i - (totalBullets - 1) / 2f) * SPREAD;
-						final short rolled = applyShotDamageMods(rolledDamage, abilityCtx);
+						final short rolled = CombatMath.applyShotDamageMods(rolledDamage, abilityCtx);
 						spawnAbilityBullet(realmId, player, effPgId, p,
 								source.clone(-offset, -offset), baseA + deltaA, rolled, abilityCtx);
 					}
@@ -3215,14 +3210,14 @@ public class RealmManagerServer implements Runnable {
 				// Ability item scaling — defaults to STR (4) for legacy items.
 				rolledDamage += statByIndex(player.getComputedStats(),
 						abilityItem.getScalingStat());
-				rolledDamage = applyShotDamageMods(rolledDamage, abilityCtx);
+				rolledDamage = CombatMath.applyShotDamageMods(rolledDamage, abilityCtx);
 				{
 					final int totalBullets = 1 + abilityCtx.getExtraProjectiles();
 					final float SPREAD = 0.10f;
 					final float baseA = Float.parseFloat(p.getAngle());
 					for (int i = 0; i < totalBullets; i++) {
 						final float deltaA = (i - (totalBullets - 1) / 2f) * SPREAD;
-						final short rolled = applyShotDamageMods(rolledDamage, abilityCtx);
+						final short rolled = CombatMath.applyShotDamageMods(rolledDamage, abilityCtx);
 						spawnAbilityBullet(realmId, player, effPgId, p,
 								dest.clone(-offset, -offset), baseA + deltaA, rolled, abilityCtx);
 					}
@@ -3277,18 +3272,6 @@ public class RealmManagerServer implements Runnable {
 			log.info("[USEABILITY] skipping legacy-script for itemId={} — ab={} owns the visuals",
 					abilityItem.getItemId(), ab.getName());
 		}
-	}
-
-	private static short applyShotDamageMods(short base, ShotContext ctx) {
-		int dmg = base;
-		if (ctx.getDamagePct() != 0) dmg = dmg + (dmg * ctx.getDamagePct()) / 100;
-		if (ctx.getCritChancePct() > 0) {
-			final int roll = (int) (Math.random() * 100);
-			if (roll < ctx.getCritChancePct()) dmg = dmg * 2;
-		}
-		if (dmg < 0) dmg = 0;
-		if (dmg > Short.MAX_VALUE) dmg = Short.MAX_VALUE;
-		return (short) dmg;
 	}
 
 	private void spawnAbilityBullet(long realmId, Player player, int projectileGroupId, Projectile p,
@@ -3632,22 +3615,7 @@ public class RealmManagerServer implements Runnable {
 	 * Dungeon instances use a 1.0-lower threshold than overworld zones so a
 	 * difficulty-2.0 dungeon hits harder than the grasslands (diff 2.0) overworld.
 	 */
-	private static float difficultyDamageMult(final float difficulty, final boolean isDungeon) {
-		final float threshold = isDungeon
-				? GlobalConstants.DAMAGE_SCALE_DUNGEON_MIN_DIFFICULTY
-				: GlobalConstants.DAMAGE_SCALE_MIN_DIFFICULTY;
-		if (difficulty <= threshold) return 1.0f;
-		final float knee = GlobalConstants.DAMAGE_SCALE_KNEE_DIFFICULTY;
-		final float slope = GlobalConstants.DAMAGE_SCALE_PER_LEVEL;
-		final float slopeAfter = GlobalConstants.DAMAGE_SCALE_PER_LEVEL_AFTER_KNEE;
-		float mult;
-		if (difficulty <= knee) {
-			mult = 1.0f + slope * (difficulty - threshold);
-		} else {
-			mult = 1.0f + slope * (knee - threshold) + slopeAfter * (difficulty - knee);
-		}
-		return Math.min(mult, GlobalConstants.DAMAGE_SCALE_CAP);
-	}
+	// difficultyDamageMult moved to com.openrealm.net.server.CombatMath
 
 	/**
 	 * Phase 3 — Knight Deflect: returns true if the incoming bullet was
@@ -3889,6 +3857,24 @@ public class RealmManagerServer implements Runnable {
 			if (this.tryDeflect(targetRealm, b, player)) {
 				return;
 			}
+			// Ninja "Light On Your Feet" (12010) — if it's been 30s since the
+			// last incoming hit, dodge this one entirely and grant SPEEDY 3s.
+			// The clock restarts in either branch (dodge or normal hit), so a
+			// dodge can chain only if the next hit is also 30s+ later.
+			final PassiveAbility _ninjaP = player.getClassPassive();
+			if (_ninjaP != null && _ninjaP.getId() == 12010) {
+				final long _nowMs = Instant.now().toEpochMilli();
+				if (_nowMs - player.getLastDamageTakenMs() > 30000L) {
+					b.setPlayerHit(true);
+					targetRealm.getExpiredBullets().add(b.getId());
+					targetRealm.removeBullet(b);
+					applyStatusWithFeedback(targetRealm, player, EntityType.PLAYER,
+							StatusEffectType.SPEEDY, 3000L);
+					this.sendTextEffectToPlayer(player, TextEffect.PLAYER_INFO, "DODGE");
+					player.setLastDamageTakenMs(_nowMs);
+					return;
+				}
+			}
 			final Stats stats = player.getComputedStats();
 			b.setPlayerHit(true);
 			// Apply difficulty damage scaling based on the source enemy's
@@ -3899,7 +3885,7 @@ public class RealmManagerServer implements Runnable {
 			if (b.getSrcEntityId() != 0L) {
 				final Enemy srcEnemy = targetRealm.getEnemies().get(b.getSrcEntityId());
 				if (srcEnemy != null) {
-					rawDmg *= difficultyDamageMult(srcEnemy.getDifficulty(),
+					rawDmg *= CombatMath.difficultyDamageMult(srcEnemy.getDifficulty(),
 							targetRealm.isDungeonInstance());
 				}
 			}
@@ -3919,7 +3905,7 @@ public class RealmManagerServer implements Runnable {
 			// + a hard floor of 1 so low-damage projectiles (e.g. Pirate's 5
 			// dmg) always chip for at least 1 — without ceil the short cast
 			// would truncate 0.75 to 0 and a 7-def player would take nothing.
-			final short minDmg = (short) Math.max(1, Math.ceil(rawDmg * 0.15f));
+			final short minDmg = CombatMath.minDamageFloor((short) rawDmg);
 			short dmgToInflict;
 			if (armorPiercing || armorBroken) {
 				// Armor piercing/broken: full damage, ignore defense entirely
@@ -3936,6 +3922,10 @@ public class RealmManagerServer implements Runnable {
 			this.sendTextEffectToPlayer(player, dmgTextEffect, "-" + dmgToInflict);
 
 			player.setHealth(player.getHealth() - dmgToInflict);
+			// Update last-damage timestamp so the Ninja "Light On Your Feet"
+			// 30-second dodge timer restarts on a real hit. Cheap; not gated
+			// on the passive being equipped.
+			player.setLastDamageTakenMs(Instant.now().toEpochMilli());
 			// Gemstone onPlayerHit hook — Thorns, on-hit-self triggers, etc.
 			if (dmgToInflict > 0) {
 				final Enemy attacker = b.getSrcEntityId() != 0L
@@ -3989,10 +3979,7 @@ public class RealmManagerServer implements Runnable {
 		if (circleHit(b, e) && !b.isEnemy()) {
 			final boolean armorPiercing = b.hasFlag(ProjectileFlag.ARMOR_PIERCING);
 			final boolean armorBroken = e.hasEffect(StatusEffectType.ARMOR_BROKEN);
-			// 15% damage floor with Math.ceil + hard min of 1 so weak
-			// shots still chip armored enemies — without ceil the short cast
-			// truncated 0.75 to 0 and any def >= raw dealt nothing.
-			final short minDmg = (short) Math.max(1, Math.ceil(b.getDamage() * 0.15));
+			final short minDmg = CombatMath.minDamageFloor(b.getDamage());
 			short dmgToInflict;
 			if (armorPiercing || armorBroken) {
 				// Armor piercing/broken: full damage, ignore defense entirely
@@ -4008,7 +3995,10 @@ public class RealmManagerServer implements Runnable {
 					final Player src = this.getPlayerById(b.getSrcEntityId());
 					if (src != null) {
 						final PassiveAbility pass = src.getClassPassive();
-						if (pass != null && pass.getId() == 11014) {
+						// Legacy passive id 11014 (Heavy Debuffer) and the
+						// rewrite-era Duelist passive 12003 both grant the
+						// same "Precision Striker" armor-pen mechanic.
+						if (pass != null && (pass.getId() == 11014 || pass.getId() == 12003)) {
 							final int pen = src.getComputedStats().getDex() / PRECISION_STRIKER_DEX_DIVISOR;
 							effectiveDef = Math.max(0, effectiveDef - pen);
 						}
@@ -4057,6 +4047,17 @@ public class RealmManagerServer implements Runnable {
 				final Player srcPlayer = this.getPlayerById(b.getSrcEntityId());
 				if (srcPlayer != null) {
 					final PassiveAbility pa = srcPlayer.getClassPassive();
+					// Cultist "Leech Energy" (12011) — basic-attack hits restore
+					// (1 + DEX/100) MP. Unconditional (no proc chance), runs
+					// outside the trigger-table loop below since it doesn't
+					// match the PROC_CHANCE pattern.
+					if (pa != null && pa.getId() == 12011) {
+						final int mpRestore = 1 + (srcPlayer.getComputedStats().getDex() / 100);
+						final int maxMp = srcPlayer.getComputedStats().getMp();
+						if (srcPlayer.getMana() < maxMp) {
+							srcPlayer.setMana(Math.min(maxMp, srcPlayer.getMana() + mpRestore));
+						}
+					}
 					if (pa != null) {
 						for (PassiveTrigger trig : pa.triggerList()) {
 							if (!"ON_BULLET_HIT_ENEMY".equalsIgnoreCase(trig.getEvent())) continue;

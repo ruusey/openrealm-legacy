@@ -47,6 +47,10 @@ import lombok.extern.slf4j.Slf4j;
 public class Player extends Entity {
 	private GameItem[] inventory;
 	private long lastStatsTime;
+	// Wall-clock ms of the last time this player took damage. Drives the Ninja
+	// "Light On Your Feet" (12010) 30-second dodge: if 30s have passed without
+	// taking a hit, the next incoming projectile is dodged and SPEEDY is granted.
+	private long lastDamageTakenMs;
 	private LootContainer currentLootContainer;
 	private int classId;
 	private String accountUuid;
@@ -150,7 +154,8 @@ public class Player extends Entity {
 		super(0, null, 0);
 	}
 
-	public Player(GameItem[] inventory, long lastStatsTime, LootContainer currentLootContainer, int classId,
+	public Player(GameItem[] inventory, long lastStatsTime, long lastDamageTakenMs,
+			LootContainer currentLootContainer, int classId,
 			String accountUuid, String characterUuid, long experience, Stats stats, boolean headless, boolean bot,
 			String chatRole, boolean adminModeEnabled, String storedChatRole, boolean hiddenFromOthers,
 			int lastInputSeq, int lastProcessedInputSeq, float currentVx, float currentVy,
@@ -162,6 +167,7 @@ public class Player extends Entity {
 		super(0, null, 0);
 		this.inventory = inventory;
 		this.lastStatsTime = lastStatsTime;
+		this.lastDamageTakenMs = lastDamageTakenMs;
 		this.currentLootContainer = currentLootContainer;
 		this.classId = classId;
 		this.accountUuid = accountUuid;
@@ -577,6 +583,34 @@ public class Player extends Entity {
 		if (this.hasEffect(StatusEffectType.EMPOWERED_DEX)) {
 			final short bonus = this.getEffectMagnitude(StatusEffectType.EMPOWERED_DEX);
 			if (bonus > 0) stats.setDex((short) Math.min(Short.MAX_VALUE, stats.getDex() + bonus));
+		}
+		// Class-passive stat hooks — passives with no `triggers` array in the
+		// data are implemented here for stat-modifying effects so getComputedStats
+		// is the single source of truth for derived stats.
+		final PassiveAbility _passive = this.getClassPassive();
+		if (_passive != null) {
+			switch (_passive.getId()) {
+				case 12009: { // Knight "Thick Skin" — +(VIT/5) flat DEF.
+					final int bonus = stats.getVit() / 5;
+					if (bonus > 0) stats.setDef((short) Math.min(Short.MAX_VALUE, stats.getDef() + bonus));
+					break;
+				}
+				case 12007: { // Druid "Will of Nature" — +(DEX/10) WIS.
+					final int bonus = stats.getDex() / 10;
+					if (bonus > 0) stats.setWis((short) Math.min(Short.MAX_VALUE, stats.getWis() + bonus));
+					break;
+				}
+				case 12002: { // Wizard "Uncontestable Knowledge" — +1 WIS per
+					// every 20 points of MP above the class base. Reads
+					// equipment-bonus MP only (excludes the base value).
+					final int baseMp = this.stats.getMp();
+					final int bonusMp = Math.max(0, stats.getMp() - baseMp);
+					final int bonus = bonusMp / 20;
+					if (bonus > 0) stats.setWis((short) Math.min(Short.MAX_VALUE, stats.getWis() + bonus));
+					break;
+				}
+				default: break;
+			}
 		}
 		return stats;
 	}
