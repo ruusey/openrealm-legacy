@@ -7,7 +7,7 @@
 * [@Aurusenth](https://github.com/Aurusenth)
 
 <div>
-    <img src="https://github.com/ruusey/openrealm/blob/main/banner.png" width="100%">
+    <img src="https://github.com/ruusey/openrealm-legacy/blob/main/banner.gif?raw=true" width="100%">
     <img src="https://github.com/ruusey/openrealm/blob/main/MobileView.png" width="100%">
 </div>
 
