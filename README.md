@@ -59,6 +59,32 @@ OpenRealm consists of two services:
 
 ---
 
+## Documentation
+
+A comprehensive, implementation-level guide to how the game server works end to
+end lives in [`docs/server-guide/`](docs/server-guide/README.md) — the process
+and thread model, the binary protocol and full packet catalog, the 64Hz game
+loop and realm management, enemy AI and scripting, projectiles and combat math,
+procedural world generation, the item/ability/class systems, and how the server
+integrates with the data service and clients.
+
+| Chapter | Topic |
+|---------|-------|
+| [Overview](docs/server-guide/server-architecture-overview.md) | Process model, bootstrap, threads, top-level data flow |
+| [Networking & Protocol](docs/server-guide/networking-and-protocol.md) | Transports, serialization framework, compression, full packet catalog, handshake |
+| [Game Loop & Realms](docs/server-guide/game-loop-and-realms.md) | 64Hz tick, sub-tick divisors, realms, spatial grid, visibility, persistence |
+| [Enemy AI & Scripting](docs/server-guide/enemy-ai-and-scripting.md) | Enemy model, phases, movement/attack patterns, EnemyScript SDK, hordes |
+| [Projectiles & Combat](docs/server-guide/projectiles-and-combat.md) | Projectile groups, position modes + formulas, flags, damage formula, abilities |
+| [Terrain & Dungeon Generation](docs/server-guide/terrain-and-dungeon-generation.md) | Tiles, overworld zones, procedural dungeons, set pieces, decorators |
+| [Items, Abilities & Classes](docs/server-guide/items-abilities-classes.md) | Item model, rarity, gems, enchantments, abilities/passives, loot, forge |
+| [Data-Service Integration](docs/server-guide/data-service-integration.md) | HTTP endpoints, DTOs, auth, game-data loading, persistence, metrics |
+| [PvP, Parties, Trading & Events](docs/server-guide/pvp-parties-trading-events.md) | PvP, parties, trade state machine, realm events + purification, commands |
+| [Client Integration](docs/server-guide/client-integration.md) | Client contract: prediction, interpolation, deterministic projectile re-sim |
+
+Feature design docs (rationale and tuning) also live in [`docs/`](docs/).
+
+---
+
 ## Getting Started
 
 ### Prerequisites
